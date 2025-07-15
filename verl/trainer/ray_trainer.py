@@ -46,6 +46,7 @@ from ..workers.reward import FunctionRewardManager
 from . import core_algos
 from .config import PPOConfig
 from .core_algos import AdvantageEstimator, FixedKLController, KLController, compute_kl, get_kl_controller
+from .simple_tree_trainer import SimpleTreeGRPOMixin
 from .metrics import (
     compute_data_metrics,
     compute_length_metrics,
@@ -149,6 +150,10 @@ def compute_advantage(data: DataProto, adv_estimator: AdvantageEstimator, gamma:
         )
     elif adv_estimator == AdvantageEstimator.RLOO:
         advantages, returns = core_algos.compute_rloo_outcome_advantage(token_level_rewards, response_mask, index)
+    elif adv_estimator == AdvantageEstimator.TREE_GRPO:
+        # For TreeGRPO, we'll handle advantage computation differently in the tree traversal
+        # This is a placeholder that will be overridden by tree-specific computation
+        advantages, returns = core_algos.compute_grpo_outcome_advantage(token_level_rewards, response_mask, index)
     else:
         raise NotImplementedError
 
@@ -157,9 +162,10 @@ def compute_advantage(data: DataProto, adv_estimator: AdvantageEstimator, gamma:
     return data
 
 
-class RayPPOTrainer:
+class RayPPOTrainer(SimpleTreeGRPOMixin):
     """
     Note that this trainer runs on the driver process on a single CPU/GPU node.
+    Inherits from SimpleTreeGRPOMixin to support TreeGRPO algorithm with simplified implementation.
     """
 
     def __init__(
@@ -248,6 +254,8 @@ class RayPPOTrainer:
         config.worker.actor.optim.training_steps = self.training_steps
         config.worker.critic.optim.training_steps = self.training_steps
         print(f"Total training steps: {self.training_steps}")
+        
+        # TreeGRPO parameters are handled in the simplified implementation
 
     def init_workers(self) -> None:
         """Init resource pool and worker group"""
@@ -532,16 +540,13 @@ class RayPPOTrainer:
             current_batch_size = len(batch) // self.config.worker.rollout.n
             rollout_batch_size = self.config.data.rollout_batch_size
             if current_batch_size < rollout_batch_size:
-                print(f"{current_batch_size=} < {rollout_batch_size=}")
                 max_try_make_batch = self.config.trainer.max_try_make_batch
                 if max_try_make_batch <= 0 or num_try_make_batch < max_try_make_batch:
-                    print(f"{num_try_make_batch=}. Continue generating...")
                 else:
                     raise ValueError(
                         f"{num_try_make_batch=} >= {max_try_make_batch=}. Generated too many. Please check your data."
                     )
             else:
-                print(f"{current_batch_size=} >= {rollout_batch_size=}. Finish generating.")
                 if self.config.algorithm.online_filtering:
                     metrics.update({f"reward/{k}": v for k, v in reduce_metrics(all_metrics).items()})
 
@@ -576,65 +581,166 @@ class RayPPOTrainer:
 
             metrics, timing_raw = {}, {}
             with timer("step", timing_raw):
-                # make a batch of data
-                with timer("gen", timing_raw):
-                    self.actor_rollout_ref_wg.prepare_rollout_engine()
-                    batch = self._make_batch_data(metrics=metrics)
-                    self.actor_rollout_ref_wg.release_rollout_engine()
+                # TreeGRPO uses a different training approach
+                if self.config.algorithm.adv_estimator == AdvantageEstimator.TREE_GRPO:
+                    with timer("tree_grpo", timing_raw):
+                        # Get a batch of prompts
+                        batch_dict = next(self.data_iterator, None)
+                        if batch_dict is None:
+                            self.data_iterator = iter(self.train_dataloader)
+                            batch_dict = next(self.data_iterator)
+                        
+                        input_batch = DataProto.from_single_dict(batch_dict)
+                        input_batch.meta_info.update({
+                            "min_pixels": self.config.data.min_pixels,
+                            "max_pixels": self.config.data.max_pixels,
+                            "video_fps": self.config.data.video_fps,
+                            "temperature": self.config.worker.rollout.temperature,
+                            "top_p": self.config.worker.rollout.top_p,
+                            "top_k": self.config.worker.rollout.top_k,
+                            "n": self.config.worker.rollout.n,
+                            "max_new_tokens": self.config.worker.rollout.step_length,
+                        })
+                        
+                        # Use standard generation for TreeGRPO
+                        self.actor_rollout_ref_wg.prepare_rollout_engine()
+                        batch = self._make_batch_data(metrics=metrics)
+                        self.actor_rollout_ref_wg.release_rollout_engine()
+                        
+                        # Balance batch and compute global tokens
+                        self._balance_batch(batch, metrics=metrics)
+                        batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+                        
+                        # Compute rewards for TreeGRPO
+                        with timer("reward", timing_raw):
+                            reward_tensor, reward_metrics = ray.get(self.reward_fn.compute_reward.remote(batch))
+                            batch.batch["token_level_scores"] = reward_tensor
+                            reward_metrics = {f"reward/{k}": v for k, v in reduce_metrics(reward_metrics).items()}
+                            metrics.update(reward_metrics)
+                        
+                        # Compute old_log_probs
+                        with timer("old", timing_raw):
+                            old_log_probs = self.actor_rollout_ref_wg.compute_log_probs(batch)
+                            batch = batch.union(old_log_probs)
+                        
+                        # Compute ref_log_probs if using reference policy
+                        if self.use_reference_policy:
+                            with timer("ref", timing_raw):
+                                ref_log_probs = self.actor_rollout_ref_wg.compute_ref_log_probs(batch)
+                                batch = batch.union(ref_log_probs)
+                        
+                        # Apply KL penalty if needed
+                        if not self.config.algorithm.use_kl_loss and self.use_reference_policy:
+                            batch, kl_metrics = apply_kl_penalty(batch, self.kl_ctrl, self.config.algorithm.kl_penalty)
+                            metrics.update(kl_metrics)
+                        else:
+                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+                        
+                        # Compute TreeGRPO advantages on generated sequences
+                        batch, train_acc, response_tokens = self._compute_batch_tree_advantage_simple(batch)
+                        
+                        if batch is None:
+                            print("TreeGRPO: No valid training data generated, skipping step")
+                            continue
+                        
+                        metrics["train/accuracy"] = train_acc
+                        metrics["train/response_tokens"] = response_tokens
+                else:
+                    # Original PPO/GRPO training
+                    with timer("gen", timing_raw):
+                        self.actor_rollout_ref_wg.prepare_rollout_engine()
+                        batch = self._make_batch_data(metrics=metrics)
+                        self.actor_rollout_ref_wg.release_rollout_engine()
 
-                # balance the number of valid tokens on each dp rank.
-                # NOTE: this breaks the order of data inside the batch.
-                # Please take care when you implement group based adv computation such as GRPO and rloo
-                self._balance_batch(batch, metrics=metrics)
+                # TreeGRPO already has computed advantages, skip most preprocessing steps
+                if self.config.algorithm.adv_estimator != AdvantageEstimator.TREE_GRPO:
+                    # balance the number of valid tokens on each dp rank.
+                    # NOTE: this breaks the order of data inside the batch.
+                    # Please take care when you implement group based adv computation such as GRPO and rloo
+                    self._balance_batch(batch, metrics=metrics)
 
-                # compute global valid tokens
-                batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+                    # compute global valid tokens
+                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
-                # compute reward
-                if "token_level_scores" not in batch.batch:
-                    with timer("reward", timing_raw):
-                        reward_ref = self.reward_fn.compute_reward.remote(batch)
-
-                # recompute old_log_probs
-                with timer("old", timing_raw):
-                    old_log_probs = self.actor_rollout_ref_wg.compute_log_probs(batch)
-                    batch = batch.union(old_log_probs)
-
-                # compute ref_log_probs
-                if self.use_reference_policy:
-                    with timer("ref", timing_raw):
-                        ref_log_probs = self.actor_rollout_ref_wg.compute_ref_log_probs(batch)
-                        batch = batch.union(ref_log_probs)
-
-                # compute values
-                if self.use_critic:
-                    with timer("values", timing_raw):
-                        values = self.critic_wg.compute_values(batch)
-                        batch = batch.union(values)
-
-                with timer("adv", timing_raw):
+                    # compute reward
                     if "token_level_scores" not in batch.batch:
-                        # get token level scores asynchronously
-                        reward_tensor, reward_metrics = ray.get(reward_ref)
+                        with timer("reward", timing_raw):
+                            reward_ref = self.reward_fn.compute_reward.remote(batch)
+
+                    # recompute old_log_probs
+                    with timer("old", timing_raw):
+                        old_log_probs = self.actor_rollout_ref_wg.compute_log_probs(batch)
+                        batch = batch.union(old_log_probs)
+
+                    # compute ref_log_probs
+                    if self.use_reference_policy:
+                        with timer("ref", timing_raw):
+                            ref_log_probs = self.actor_rollout_ref_wg.compute_ref_log_probs(batch)
+                            batch = batch.union(ref_log_probs)
+
+                    # compute values
+                    if self.use_critic:
+                        with timer("values", timing_raw):
+                            values = self.critic_wg.compute_values(batch)
+                            batch = batch.union(values)
+
+                    with timer("adv", timing_raw):
+                        if "token_level_scores" not in batch.batch:
+                            # get token level scores asynchronously
+                            reward_tensor, reward_metrics = ray.get(reward_ref)
+                            batch.batch["token_level_scores"] = reward_tensor
+                            reward_metrics = {f"reward/{k}": v for k, v in reduce_metrics(reward_metrics).items()}
+                            metrics.update(reward_metrics)
+
+                        # apply kl penalty if available
+                        if not self.config.algorithm.use_kl_loss and self.use_reference_policy:
+                            # apply kl penalty to reward
+                            batch, kl_metrics = apply_kl_penalty(batch, self.kl_ctrl, self.config.algorithm.kl_penalty)
+                            metrics.update(kl_metrics)
+                        else:
+                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                        # compute advantages, executed on the driver process
+                        batch = compute_advantage(
+                            batch,
+                            adv_estimator=self.config.algorithm.adv_estimator,
+                            gamma=self.config.algorithm.gamma,
+                            lam=self.config.algorithm.lam,
+                        )
+                else:
+                    # TreeGRPO processing
+                    self._balance_batch(batch, metrics=metrics)
+                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+                    
+                    # Compute rewards for TreeGRPO
+                    with timer("reward", timing_raw):
+                        reward_tensor, reward_metrics = ray.get(self.reward_fn.compute_reward.remote(batch))
                         batch.batch["token_level_scores"] = reward_tensor
                         reward_metrics = {f"reward/{k}": v for k, v in reduce_metrics(reward_metrics).items()}
                         metrics.update(reward_metrics)
-
-                    # apply kl penalty if available
+                    
+                    # recompute old_log_probs
+                    with timer("old", timing_raw):
+                        old_log_probs = self.actor_rollout_ref_wg.compute_log_probs(batch)
+                        batch = batch.union(old_log_probs)
+                    
+                    # compute ref_log_probs
+                    if self.use_reference_policy:
+                        with timer("ref", timing_raw):
+                            ref_log_probs = self.actor_rollout_ref_wg.compute_ref_log_probs(batch)
+                            batch = batch.union(ref_log_probs)
+                    
+                    # Apply KL penalty if needed
                     if not self.config.algorithm.use_kl_loss and self.use_reference_policy:
-                        # apply kl penalty to reward
                         batch, kl_metrics = apply_kl_penalty(batch, self.kl_ctrl, self.config.algorithm.kl_penalty)
                         metrics.update(kl_metrics)
                     else:
                         batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
-
-                    # compute advantages, executed on the driver process
-                    batch = compute_advantage(
-                        batch,
-                        adv_estimator=self.config.algorithm.adv_estimator,
-                        gamma=self.config.algorithm.gamma,
-                        lam=self.config.algorithm.lam,
-                    )
+                    
+                    # Compute TreeGRPO advantages
+                    with timer("adv", timing_raw):
+                        batch, train_acc, response_tokens = self._compute_batch_tree_advantage_simple(batch)
+                        metrics.update({"train/accuracy": train_acc, "train/response_tokens": response_tokens})
 
                 # update critic
                 if self.use_critic:

@@ -39,6 +39,9 @@ class RolloutConfig:
     disable_log_stats: bool = True
     disable_tqdm: bool = False
     val_override_config: Dict[str, Any] = field(default_factory=dict)
+    # TreeGRPO specific config
+    step_length: int = 256
+    """Step length for tree-based generation in TreeGRPO algorithm"""
     # below are auto keys
     prompt_length: int = field(default=-1, init=False)
     response_length: int = field(default=-1, init=False)

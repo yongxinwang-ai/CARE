@@ -83,6 +83,7 @@ class AdvantageEstimator(str, Enum):
     REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
     REMAX = "remax"
     RLOO = "rloo"
+    TREE_GRPO = "tree_grpo"
 
 
 def get_kl_controller(algorithm_config: "AlgorithmConfig") -> KLController:
@@ -295,6 +296,66 @@ def compute_remax_outcome_advantage(
     scores = token_level_rewards.sum(dim=-1) - reward_baselines
     returns = scores.unsqueeze(-1) * response_mask
     return returns, returns
+
+
+@torch.no_grad()
+def compute_tree_grpo_outcome_advantage(
+    token_level_rewards: torch.Tensor, 
+    response_mask: torch.Tensor, 
+    index: torch.Tensor, 
+    brother_rewards: list = None,
+    eps: float = 1e-6
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute advantage for TreeGRPO algorithm.
+    
+    TreeGRPO extends GRPO by computing advantages over a tree structure of partial responses.
+    This function computes the advantage for a single node in the tree, considering
+    rewards from sibling nodes (brother_rewards) at the same depth level.
+    
+    Args:
+        token_level_rewards: `(torch.Tensor)`
+            shape: (bs, response_length) - rewards for each token in the response
+        response_mask: `(torch.Tensor)`
+            shape: (bs, response_length) - mask indicating valid response tokens
+        index: `(torch.Tensor)`
+            shape: (bs,) - indices for grouping responses from the same prompt
+        brother_rewards: `(list)`
+            List of rewards from sibling nodes at the same tree depth
+        eps: `(float)`
+            epsilon value to avoid division by zero
+    
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape: (bs, response_length) - normalized advantages
+        returns: `(torch.Tensor)`
+            shape: (bs, response_length) - same as advantages for TreeGRPO
+    """
+    # For root nodes or when no siblings exist, return zero advantage
+    if brother_rewards is None or len(brother_rewards) <= 1:
+        # With single node, we can't compute relative advantage
+        advantages = torch.zeros_like(token_level_rewards)
+        return advantages, advantages
+    
+    # Compute node reward (sum of token-level rewards)
+    node_reward = token_level_rewards.sum(dim=-1).item() if token_level_rewards.dim() > 1 else token_level_rewards.sum().item()
+    
+    # Compute mean and std of brother rewards (including this node)
+    all_rewards = brother_rewards  # brother_rewards already includes current node
+    mean_reward = torch.tensor(all_rewards).mean()
+    std_reward = torch.tensor(all_rewards).std()
+    
+    # Normalize the advantage
+    if std_reward > eps:
+        normalized_advantage = (node_reward - mean_reward) / (std_reward + eps)
+    else:
+        normalized_advantage = 0.0
+    
+    # Apply advantage to all tokens in the response
+    advantages = torch.full_like(token_level_rewards, normalized_advantage)
+    advantages = advantages * response_mask
+    
+    return advantages, advantages
 
 
 def compute_rewards(
