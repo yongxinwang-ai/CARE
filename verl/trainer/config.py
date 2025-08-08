@@ -101,6 +101,20 @@ class AlgorithmConfig:
     """filter out low reward samples if online filtering"""
     filter_high: float = 0.99
     """filter out high reward samples if online filtering"""
+    grpo_variant: str = "standard"
+    """GRPO variant: 'standard', 'pge', or 'cgsg'"""
+    pge_config: dict = field(default_factory=lambda: {
+        "num_perturbations": 4,
+        "perturbation_methods": ["token_substitute", "token_delete", "token_insert"],
+        "perturbation_strength": 0.1
+    })
+    """PGE configuration"""
+    cgsg_config: dict = field(default_factory=lambda: {
+        "num_negatives": 4,
+        "negative_selection_strategy": "lowest_reward",
+        "loss_type": "normalized_advantage"
+    })
+    """CGSG configuration"""
 
 
 @dataclass

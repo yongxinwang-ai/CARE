@@ -30,6 +30,21 @@ algorithm:
   filter_key: overall
   filter_low: 0.01
   filter_high: 0.99
+  
+  # GRPO variant configuration
+  grpo_variant: standard  # Options: "standard", "pge", "cgsg"
+  
+  # PGE (Perturbed Golden Ensemble) configuration
+  pge_config:
+    num_perturbations: 4  # Number of perturbed variants (N)
+    perturbation_methods: ["token_substitute", "token_delete", "token_insert"]
+    perturbation_strength: 0.1  # Probability of applying perturbation
+    
+  # CGSG (Contrastive Golden Sample Group) configuration  
+  cgsg_config:
+    num_negatives: 4  # Number of hard negatives to select
+    negative_selection_strategy: "lowest_reward"  # Options: "lowest_reward", "max_diversity"
+    loss_type: "normalized_advantage"  # Options: "normalized_advantage", "contrastive_loss"
 
 worker:
   actor:

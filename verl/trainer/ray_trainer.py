@@ -23,12 +23,13 @@ from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Dict, List, Optional, Tuple, Type
 
 import numpy as np
 import ray
 import torch
 from ray.experimental.tqdm_ray import tqdm
+from tensordict import TensorDict
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PreTrainedTokenizer, ProcessorMixin
 
@@ -128,11 +129,98 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: KLController, kl_penalty="kl"):
     return data, metrics
 
 
+def compute_cgsg_contrastive_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    cgsg_labels: torch.Tensor,
+    num_groups: int,
+    samples_per_group: int,
+    eps: float = 1e-6
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute contrastive advantages for CGSG.
+    
+    Args:
+        token_level_rewards: Token-level rewards (batch_size, seq_len)
+        response_mask: Response mask (batch_size, seq_len)
+        cgsg_labels: Labels indicating golden (1) or negative (0) samples
+        num_groups: Number of prompt groups
+        samples_per_group: Number of samples per group (1 golden + N negatives)
+        eps: Small value for numerical stability
+        
+    Returns:
+        advantages: Contrastive advantages
+        returns: Returns (same as advantages for outcome-based rewards)
+    """
+    # Sum token rewards to get response-level rewards
+    scores = token_level_rewards.sum(dim=-1)
+    
+    # Reshape to group structure
+    scores = scores.view(num_groups, samples_per_group)
+    labels = cgsg_labels.view(num_groups, samples_per_group)
+    
+    # Compute contrastive advantages
+    advantages = torch.zeros_like(scores)
+    
+    for i in range(num_groups):
+        group_scores = scores[i]
+        group_labels = labels[i]
+        
+        # Find golden sample (label = 1)
+        golden_mask = group_labels == 1
+        golden_score = group_scores[golden_mask].item()
+        
+        # Find negative samples (label = 0)
+        negative_mask = group_labels == 0
+        negative_scores = group_scores[negative_mask]
+        
+        # Compute softmax normalization for contrastive loss
+        # A_golden = log(exp(r_golden) / (exp(r_golden) + sum(exp(r_neg))))
+        exp_golden = torch.exp(golden_score)
+        exp_negatives = torch.exp(negative_scores)
+        denominator = exp_golden + exp_negatives.sum()
+        
+        # Golden sample gets positive advantage
+        advantages[i][golden_mask] = torch.log(exp_golden / (denominator + eps))
+        
+        # Negative samples get negative advantages
+        if negative_mask.any():
+            for j, is_neg in enumerate(negative_mask):
+                if is_neg:
+                    advantages[i][j] = -torch.log(exp_negatives[negative_mask[:j+1].sum()-1] / (denominator + eps))
+    
+    # Flatten back to batch dimension
+    advantages = advantages.view(-1)
+    
+    # Expand to token level
+    returns = advantages.unsqueeze(-1) * response_mask
+    advantages = returns
+    
+    return advantages, returns
+
+
 def compute_advantage(data: DataProto, adv_estimator: AdvantageEstimator, gamma: float = 1.0, lam: float = 1.0):
     token_level_rewards = data.batch["token_level_rewards"]
     response_mask = data.batch["response_mask"]
     index = data.non_tensor_batch["uid"]
-    if adv_estimator == AdvantageEstimator.GAE:
+    
+    # Check if CGSG is applied
+    if data.meta_info.get("cgsg_applied", False):
+        loss_type = data.meta_info.get("loss_type", "normalized_advantage")
+        cgsg_labels = data.batch["cgsg_labels"]
+        
+        if loss_type == "normalized_advantage":
+            # Use standard GRPO advantage computation
+            # The structure of the batch (golden + negatives) will naturally create contrast
+            advantages, returns = core_algos.compute_grpo_outcome_advantage(token_level_rewards, response_mask, index)
+        elif loss_type == "contrastive_loss":
+            # Implement contrastive loss-based advantages
+            advantages, returns = compute_cgsg_contrastive_advantage(
+                token_level_rewards, response_mask, cgsg_labels, 
+                data.meta_info["num_groups"], data.meta_info["samples_per_group"]
+            )
+        else:
+            raise ValueError(f"Unknown CGSG loss type: {loss_type}")
+    elif adv_estimator == AdvantageEstimator.GAE:
         values = data.batch["values"]
         advantages, returns = core_algos.compute_gae_advantage_return(
             token_level_rewards, values, response_mask, gamma, lam
@@ -462,6 +550,290 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
             seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix
         )
         metrics.update(global_balance_stats)
+    
+    def _apply_pge_variant(self, batch: DataProto) -> DataProto:
+        """Apply Perturbed Golden Ensemble (PGE) variant processing.
+        
+        1. Select golden samples (highest reward per prompt)
+        2. Generate perturbations of golden samples
+        3. Construct new batch with golden + perturbations
+        4. Re-evaluate rewards for the new batch
+        """
+        from ..utils.perturbations import substitute_tokens, delete_tokens, insert_tokens
+        
+        pge_config = self.config.algorithm.pge_config
+        n_rollouts = self.config.worker.rollout.n
+        
+        # Get rewards if not already computed
+        if "token_level_scores" not in batch.batch:
+            reward_tensor, _ = ray.get(self.reward_fn.compute_reward.remote(batch))
+            batch.batch["token_level_scores"] = reward_tensor
+        
+        # Sum token rewards to get response-level rewards
+        response_rewards = batch.batch["token_level_scores"].sum(dim=-1)
+        
+        # Process each prompt group
+        total_samples = len(batch.batch["responses"])
+        batch_size = total_samples // n_rollouts
+        
+        new_responses = []
+        new_prompts = []
+        new_input_ids = []
+        new_attention_masks = []
+        new_position_ids = []
+        new_response_masks = []
+        
+        vocab_size = len(self.tokenizer)
+        special_token_ids = self.tokenizer.all_special_ids if hasattr(self.tokenizer, 'all_special_ids') else []
+        
+        for i in range(batch_size):
+            # Get rewards for this prompt's rollouts
+            start_idx = i * n_rollouts
+            end_idx = (i + 1) * n_rollouts
+            prompt_rewards = response_rewards[start_idx:end_idx]
+            
+            # Select golden sample (highest reward)
+            golden_idx_local = torch.argmax(prompt_rewards).item()
+            golden_idx = start_idx + golden_idx_local
+            
+            # Extract golden sample
+            golden_response = batch.batch["responses"][golden_idx]
+            golden_prompt = batch.batch["prompts"][golden_idx]
+            golden_input_ids = batch.batch["input_ids"][golden_idx]
+            golden_attention_mask = batch.batch["attention_mask"][golden_idx]
+            golden_position_ids = batch.batch["position_ids"][golden_idx]
+            golden_response_mask = batch.batch["response_mask"][golden_idx]
+            
+            # Add golden sample to new batch
+            new_responses.append(golden_response)
+            new_prompts.append(golden_prompt)
+            new_input_ids.append(golden_input_ids)
+            new_attention_masks.append(golden_attention_mask)
+            new_position_ids.append(golden_position_ids)
+            new_response_masks.append(golden_response_mask)
+            
+            # Generate perturbations
+            num_perturbations = pge_config["num_perturbations"]
+            perturbation_methods = pge_config["perturbation_methods"]
+            perturbation_strength = pge_config["perturbation_strength"]
+            
+            for _ in range(num_perturbations):
+                # Apply perturbations to golden response
+                perturbed_response = golden_response.tolist()
+                
+                for method in perturbation_methods:
+                    if method == "token_substitute":
+                        perturbed_response = substitute_tokens(
+                            perturbed_response, perturbation_strength, vocab_size, special_token_ids
+                        )
+                    elif method == "token_delete":
+                        perturbed_response = delete_tokens(
+                            perturbed_response, perturbation_strength, special_token_ids
+                        )
+                    elif method == "token_insert":
+                        perturbed_response = insert_tokens(
+                            perturbed_response, perturbation_strength, None
+                        )
+                
+                # Convert back to tensor and create full sequence
+                perturbed_response_tensor = torch.tensor(perturbed_response, device=golden_response.device)
+                
+                # Reconstruct full input_ids
+                perturbed_input_ids = torch.cat([golden_prompt, perturbed_response_tensor])
+                
+                # Create attention mask and position IDs for perturbed sequence
+                perturbed_attention_mask = torch.ones_like(perturbed_input_ids)
+                perturbed_position_ids = torch.arange(len(perturbed_input_ids), device=golden_position_ids.device)
+                
+                # Create response mask
+                perturbed_response_mask = torch.zeros_like(perturbed_input_ids)
+                perturbed_response_mask[len(golden_prompt):] = 1
+                
+                # Add to new batch
+                new_responses.append(perturbed_response_tensor)
+                new_prompts.append(golden_prompt)
+                new_input_ids.append(perturbed_input_ids)
+                new_attention_masks.append(perturbed_attention_mask)
+                new_position_ids.append(perturbed_position_ids)
+                new_response_masks.append(perturbed_response_mask)
+        
+        # Pad sequences to same length before stacking
+        from ..utils import torch_functional as VF
+        
+        pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        
+        # Pad responses
+        padded_responses = VF.pad_2d_list([r.tolist() if isinstance(r, torch.Tensor) else r for r in new_responses], 
+                                         pad_token_id, max_length=None)
+        padded_prompts = VF.pad_2d_list([p.tolist() if isinstance(p, torch.Tensor) else p for p in new_prompts], 
+                                       pad_token_id, max_length=None)
+        padded_input_ids = VF.pad_2d_list([i.tolist() if isinstance(i, torch.Tensor) else i for i in new_input_ids], 
+                                          pad_token_id, max_length=None)
+        
+        # Update masks and position IDs to match padded length
+        max_len = padded_input_ids.size(1)
+        padded_attention_masks = []
+        padded_position_ids = []
+        padded_response_masks = []
+        
+        for i, orig_len in enumerate([len(seq) for seq in new_input_ids]):
+            # Attention mask: 1 for real tokens, 0 for padding
+            mask = torch.zeros(max_len, device=new_attention_masks[0].device)
+            mask[:orig_len] = 1
+            padded_attention_masks.append(mask)
+            
+            # Position IDs
+            pos_ids = torch.arange(max_len, device=new_position_ids[0].device)
+            padded_position_ids.append(pos_ids)
+            
+            # Response mask
+            resp_mask = torch.zeros(max_len, device=new_response_masks[0].device)
+            prompt_len = len(new_prompts[i])
+            resp_mask[prompt_len:orig_len] = 1
+            padded_response_masks.append(resp_mask)
+        
+        # Create UIDs for new batch
+        new_uids = []
+        for i in range(batch_size):
+            # Each group gets same UID for GRPO advantage computation
+            group_uid = str(uuid.uuid4())
+            for _ in range(1 + num_perturbations):
+                new_uids.append(group_uid)
+        
+        # Create new non-tensor batch
+        new_non_tensor_batch = batch.non_tensor_batch.copy()
+        new_non_tensor_batch["uid"] = np.array(new_uids, dtype=object)
+        
+        # Create new batch with golden samples and perturbations
+        new_batch = DataProto(
+            batch=TensorDict({
+                "responses": padded_responses.to(batch.batch["responses"].device),
+                "prompts": padded_prompts.to(batch.batch["prompts"].device),
+                "input_ids": padded_input_ids.to(batch.batch["input_ids"].device),
+                "attention_mask": torch.stack(padded_attention_masks),
+                "position_ids": torch.stack(padded_position_ids),
+                "response_mask": torch.stack(padded_response_masks),
+            }, batch_size=len(new_responses)),
+            non_tensor_batch=new_non_tensor_batch,
+            meta_info=batch.meta_info
+        )
+        
+        # Update meta info to indicate PGE was applied
+        new_batch.meta_info["pge_applied"] = True
+        new_batch.meta_info["num_groups"] = batch_size
+        new_batch.meta_info["samples_per_group"] = 1 + num_perturbations
+        
+        return new_batch
+    
+    def _apply_cgsg_variant(self, batch: DataProto) -> DataProto:
+        """Apply Contrastive Golden Sample Group (CGSG) variant processing.
+        
+        1. Select golden samples (highest reward per prompt)
+        2. Select hard negatives (lowest rewards per prompt)
+        3. Construct new batch with golden + negatives
+        """
+        cgsg_config = self.config.algorithm.cgsg_config
+        n_rollouts = self.config.worker.rollout.n
+        
+        # Get rewards if not already computed
+        if "token_level_scores" not in batch.batch:
+            reward_tensor, _ = ray.get(self.reward_fn.compute_reward.remote(batch))
+            batch.batch["token_level_scores"] = reward_tensor
+        
+        # Sum token rewards to get response-level rewards
+        response_rewards = batch.batch["token_level_scores"].sum(dim=-1)
+        
+        # Process each prompt group
+        total_samples = len(batch.batch["responses"])
+        batch_size = total_samples // n_rollouts
+        
+        new_responses = []
+        new_prompts = []
+        new_input_ids = []
+        new_attention_masks = []
+        new_position_ids = []
+        new_response_masks = []
+        cgsg_labels = []  # 1 for golden, 0 for negatives
+        
+        num_negatives = cgsg_config["num_negatives"]
+        negative_selection = cgsg_config["negative_selection_strategy"]
+        
+        for i in range(batch_size):
+            # Get rewards for this prompt's rollouts
+            start_idx = i * n_rollouts
+            end_idx = (i + 1) * n_rollouts
+            prompt_rewards = response_rewards[start_idx:end_idx]
+            
+            # Select golden sample (highest reward)
+            golden_idx_local = torch.argmax(prompt_rewards).item()
+            golden_idx = start_idx + golden_idx_local
+            
+            # Add golden sample
+            new_responses.append(batch.batch["responses"][golden_idx])
+            new_prompts.append(batch.batch["prompts"][golden_idx])
+            new_input_ids.append(batch.batch["input_ids"][golden_idx])
+            new_attention_masks.append(batch.batch["attention_mask"][golden_idx])
+            new_position_ids.append(batch.batch["position_ids"][golden_idx])
+            new_response_masks.append(batch.batch["response_mask"][golden_idx])
+            cgsg_labels.append(1.0)  # Golden sample label
+            
+            # Select negative samples
+            if negative_selection == "lowest_reward":
+                # Sort rewards and get indices
+                sorted_indices = torch.argsort(prompt_rewards)
+                # Select lowest rewards, excluding golden sample
+                negative_indices_local = []
+                for idx in sorted_indices:
+                    if idx != golden_idx_local and len(negative_indices_local) < num_negatives:
+                        negative_indices_local.append(idx.item())
+            else:
+                raise ValueError(f"Unknown negative selection strategy: {negative_selection}")
+            
+            # Add negative samples
+            for neg_idx_local in negative_indices_local:
+                neg_idx = start_idx + neg_idx_local
+                new_responses.append(batch.batch["responses"][neg_idx])
+                new_prompts.append(batch.batch["prompts"][neg_idx])
+                new_input_ids.append(batch.batch["input_ids"][neg_idx])
+                new_attention_masks.append(batch.batch["attention_mask"][neg_idx])
+                new_position_ids.append(batch.batch["position_ids"][neg_idx])
+                new_response_masks.append(batch.batch["response_mask"][neg_idx])
+                cgsg_labels.append(0.0)  # Negative sample label
+        
+        # Create UIDs for new batch
+        new_uids = []
+        for i in range(batch_size):
+            # Each group gets same UID for GRPO advantage computation
+            group_uid = str(uuid.uuid4())
+            for _ in range(1 + len(negative_indices_local)):
+                new_uids.append(group_uid)
+        
+        # Create new non-tensor batch
+        new_non_tensor_batch = batch.non_tensor_batch.copy()
+        new_non_tensor_batch["uid"] = np.array(new_uids, dtype=object)
+        
+        # Create new batch with contrastive samples
+        new_batch = DataProto(
+            batch=TensorDict({
+                "responses": torch.stack(new_responses),
+                "prompts": torch.stack(new_prompts),
+                "input_ids": torch.stack(new_input_ids),
+                "attention_mask": torch.stack(new_attention_masks),
+                "position_ids": torch.stack(new_position_ids),
+                "response_mask": torch.stack(new_response_masks),
+                "cgsg_labels": torch.tensor(cgsg_labels, device=batch.batch["responses"].device),
+            }, batch_size=len(new_responses)),
+            non_tensor_batch=new_non_tensor_batch,
+            meta_info=batch.meta_info
+        )
+        
+        # Update meta info
+        new_batch.meta_info["cgsg_applied"] = True
+        new_batch.meta_info["loss_type"] = cgsg_config["loss_type"]
+        new_batch.meta_info["num_groups"] = batch_size
+        new_batch.meta_info["samples_per_group"] = 1 + len(negative_indices_local)
+        
+        return new_batch
 
     def _make_batch_data(self, metrics: Dict[str, Any]) -> DataProto:
         batch = None
@@ -550,7 +922,15 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
                 if self.config.algorithm.online_filtering:
                     metrics.update({f"reward/{k}": v for k, v in reduce_metrics(all_metrics).items()})
 
-                return batch[: self.config.data.rollout_batch_size * self.config.worker.rollout.n]
+                batch = batch[: self.config.data.rollout_batch_size * self.config.worker.rollout.n]
+                
+                # Apply PGE or CGSG variant processing if configured
+                if self.config.algorithm.grpo_variant == "pge":
+                    batch = self._apply_pge_variant(batch)
+                elif self.config.algorithm.grpo_variant == "cgsg":
+                    batch = self._apply_cgsg_variant(batch)
+                    
+                return batch
 
     def fit(self):
         """

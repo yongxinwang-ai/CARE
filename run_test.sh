@@ -5,9 +5,9 @@
 #SBATCH --gres=gpu:8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
-#SBATCH --output=qwen2_5_vl_7b_geo3k_tree_grpo.log
+#SBATCH --output=qwen2_5_vl_3b_geo3k_grpo_cgsg.log
 
 
 conda activate easy_r1
 
-bash examples/qwen2_5_vl_7b_geo3k_simple_tree_grpo.sh
+bash examples/qwen2_5_vl_7b_geo3k_cgsg_grpo.sh

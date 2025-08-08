@@ -4,10 +4,10 @@ set -x
 
 export PYTHONUNBUFFERED=1
 
-MODEL_PATH=Qwen/Qwen2.5-VL-7B-Instruct  # replace it with your local file path
+MODEL_PATH=Qwen/Qwen2.5-VL-3B-Instruct  # replace it with your local file path
 
 # TreeGRPO specific parameters
-STEP_LENGTH=256
+STEP_LENGTH=512
 MAX_RESPONSE_LENGTH=2048
 ROLLOUT_N=5
 
