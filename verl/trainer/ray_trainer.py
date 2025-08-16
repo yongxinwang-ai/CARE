@@ -663,11 +663,11 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
         pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
         
         # Pad responses
-        padded_responses = VF.pad_2d_list([r.tolist() if isinstance(r, torch.Tensor) else r for r in new_responses], 
+        padded_responses = VF.pad_2d_list_to_length([r.tolist() if isinstance(r, torch.Tensor) else r for r in new_responses], 
                                          pad_token_id, max_length=None)
-        padded_prompts = VF.pad_2d_list([p.tolist() if isinstance(p, torch.Tensor) else p for p in new_prompts], 
+        padded_prompts = VF.pad_2d_list_to_length([p.tolist() if isinstance(p, torch.Tensor) else p for p in new_prompts], 
                                        pad_token_id, max_length=None)
-        padded_input_ids = VF.pad_2d_list([i.tolist() if isinstance(i, torch.Tensor) else i for i in new_input_ids], 
+        padded_input_ids = VF.pad_2d_list_to_length([i.tolist() if isinstance(i, torch.Tensor) else i for i in new_input_ids], 
                                           pad_token_id, max_length=None)
         
         # Update masks and position IDs to match padded length
@@ -914,6 +914,7 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
             if current_batch_size < rollout_batch_size:
                 max_try_make_batch = self.config.trainer.max_try_make_batch
                 if max_try_make_batch <= 0 or num_try_make_batch < max_try_make_batch:
+                    continue  # Continue generating more batches
                 else:
                     raise ValueError(
                         f"{num_try_make_batch=} >= {max_try_make_batch=}. Generated too many. Please check your data."

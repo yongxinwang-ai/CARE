@@ -15,5 +15,5 @@ python3 -m verl.trainer.main \
     trainer.n_gpus_per_node=8 \
     algorithm.grpo_variant=pge \
     algorithm.pge_config.num_perturbations=4 \
-    algorithm.pge_config.perturbation_methods='["token_substitute", "token_delete"]' \
+    algorithm.pge_config.perturbation_methods='["token_substitute", "cot_step_resample"]' \
     algorithm.pge_config.perturbation_strength=0.1
