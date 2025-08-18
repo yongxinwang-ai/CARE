@@ -835,6 +835,84 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
         
         return new_batch
 
+    def _apply_pdb_variant(self, batch: DataProto) -> DataProto:
+        """
+        Apply Primal-Dual Budgeter (PDB) variant processing to the batch.
+        This modifies rewards to include dual cost penalties.
+        """
+        from ..utils.pdb_dual import PDBController
+        from ..utils.pdb_actions import ActionSpace
+        
+        pdb_config = self.config.algorithm.pdb_config
+        
+        # Initialize PDB controller if not already done
+        if not hasattr(self, 'pdb_controller'):
+            self.pdb_controller = PDBController(pdb_config)
+            self.action_space = ActionSpace(pdb_config)
+        
+        # Get current dual multipliers
+        lambda_v, lambda_t = self.pdb_controller.dual_manager.get_multipliers()
+        
+        # Process each sample in the batch
+        batch_size = len(batch) // self.config.worker.rollout.n
+        n = self.config.worker.rollout.n
+        
+        # Extract rewards if not already computed
+        if "token_level_scores" not in batch.batch:
+            reward_tensor, _ = ray.get(self.reward_fn.compute_reward.remote(batch))
+            batch.batch["token_level_scores"] = reward_tensor
+        
+        # Compute costs for each trajectory
+        visual_costs = torch.zeros(len(batch))
+        text_costs = torch.zeros(len(batch))
+        
+        # Estimate costs based on response length and visual processing
+        # This is a simplified version - in full implementation, track actual actions
+        response_ids = batch.batch.get("responses", batch.batch.get("input_ids"))
+        
+        for i in range(len(batch)):
+            # Text cost: proportional to response length
+            if response_ids is not None:
+                response_length = (response_ids[i] != self.tokenizer.pad_token_id).sum().item()
+                text_costs[i] = response_length * pdb_config.get("cost_per_text_token", 1)
+            
+            # Visual cost: estimate based on multi-modal data presence
+            if "multi_modal_data" in batch.non_tensor_batch:
+                mm_data = batch.non_tensor_batch["multi_modal_data"][i]
+                if mm_data is not None:
+                    # Simplified: assume fixed visual processing cost
+                    visual_costs[i] = pdb_config.get("cost_crop_fixed", 32)
+        
+        # Modify rewards with dual penalties
+        modified_rewards = batch.batch["token_level_scores"].clone()
+        
+        # Apply penalty: r' = r - λ_v * visual_cost - λ_t * text_cost
+        for i in range(len(batch)):
+            penalty = lambda_v * visual_costs[i] + lambda_t * text_costs[i]
+            modified_rewards[i] = modified_rewards[i] - penalty
+        
+        # Update batch with modified rewards
+        batch.batch["token_level_scores_original"] = batch.batch["token_level_scores"]
+        batch.batch["token_level_scores"] = modified_rewards
+        batch.batch["visual_costs"] = visual_costs
+        batch.batch["text_costs"] = text_costs
+        
+        # Update dual variables based on average costs
+        if batch_size > 0:
+            # Group by prompt and get average costs
+            avg_visual_cost = visual_costs.reshape(batch_size, n).mean(dim=1).mean().item()
+            avg_text_cost = text_costs.reshape(batch_size, n).mean(dim=1).mean().item()
+            
+            # Update dual manager
+            self.pdb_controller.dual_manager.update(avg_visual_cost, avg_text_cost)
+        
+        # Update meta info
+        batch.meta_info["pdb_applied"] = True
+        batch.meta_info["lambda_v"] = lambda_v
+        batch.meta_info["lambda_t"] = lambda_t
+        
+        return batch
+
     def _make_batch_data(self, metrics: Dict[str, Any]) -> DataProto:
         batch = None
         all_metrics = defaultdict(list)
@@ -914,6 +992,7 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
             if current_batch_size < rollout_batch_size:
                 max_try_make_batch = self.config.trainer.max_try_make_batch
                 if max_try_make_batch <= 0 or num_try_make_batch < max_try_make_batch:
+                    continue
                 else:
                     raise ValueError(
                         f"{num_try_make_batch=} >= {max_try_make_batch=}. Generated too many. Please check your data."
@@ -924,11 +1003,13 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
 
                 batch = batch[: self.config.data.rollout_batch_size * self.config.worker.rollout.n]
                 
-                # Apply PGE or CGSG variant processing if configured
+                # Apply GRPO variant processing if configured
                 if self.config.algorithm.grpo_variant == "pge":
                     batch = self._apply_pge_variant(batch)
                 elif self.config.algorithm.grpo_variant == "cgsg":
                     batch = self._apply_cgsg_variant(batch)
+                elif self.config.algorithm.grpo_variant == "pdb":
+                    batch = self._apply_pdb_variant(batch)
                     
                 return batch
 

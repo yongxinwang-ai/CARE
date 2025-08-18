@@ -102,7 +102,7 @@ class AlgorithmConfig:
     filter_high: float = 0.99
     """filter out high reward samples if online filtering"""
     grpo_variant: str = "standard"
-    """GRPO variant: 'standard', 'pge', or 'cgsg'"""
+    """GRPO variant: 'standard', 'pge', 'cgsg', or 'pdb'"""
     pge_config: dict = field(default_factory=lambda: {
         "num_perturbations": 4,
         "perturbation_methods": ["token_substitute", "token_delete", "token_insert"],
@@ -115,6 +115,51 @@ class AlgorithmConfig:
         "loss_type": "normalized_advantage"
     })
     """CGSG configuration"""
+    pdb_config: dict = field(default_factory=lambda: {
+        "visual_budget": 512,
+        "text_budget": 160,
+        "lambda_v_init": 0.02,
+        "lambda_t_init": 0.01,
+        "lambda_v_lr": 0.001,
+        "lambda_t_lr": 0.001,
+        "cost_per_patch": 1,
+        "cost_crop_fixed": 32,
+        "cost_draw_per_primitive": 4,
+        "cost_per_text_token": 1,
+        "cost_tool_ocr": 64,
+        "cost_tool_detect": 48,
+        "gain_estimators": ["entropy", "consistency", "task"],
+        "gain_weights": [0.4, 0.3, 0.3],
+        "gain_temperature": 1.0,
+        "stopping_threshold": 0.0,
+        "enable_crop": True,
+        "enable_draw": True,
+        "enable_tool": False,
+        "max_crop_candidates": 5,
+        "max_draw_primitives": 3,
+        "sla_mode": "normal",
+        "sla_presets": {
+            "strict": {
+                "visual_budget": 256,
+                "text_budget": 80,
+                "lambda_v_init": 0.04,
+                "lambda_t_init": 0.02
+            },
+            "normal": {
+                "visual_budget": 512,
+                "text_budget": 160,
+                "lambda_v_init": 0.02,
+                "lambda_t_init": 0.01
+            },
+            "relaxed": {
+                "visual_budget": 1024,
+                "text_budget": 320,
+                "lambda_v_init": 0.01,
+                "lambda_t_init": 0.005
+            }
+        }
+    })
+    """PDB (Primal-Dual Budgeter) configuration"""
 
 
 @dataclass
