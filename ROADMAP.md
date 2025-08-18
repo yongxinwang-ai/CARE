@@ -185,18 +185,11 @@ end
 
 
 ## Current Tasks
+action set当前只包含直接回答和cot两种形式，其他的action暂时不需要实现
 
-### Completed
-- ✅ Implement PGE (Perturbed Golden Ensemble) - See: Phase 1-2 below
-- ✅ Implement CGSG (Contrastive Golden Sample Group) - See: Phase 3 below
-- ✅ Create experiment scripts - See: Phase 4 below
 
 ### Active Development
-- ✅ Implement Primal–Dual Budgeter (PDB) - See: /tasks/001-pdb.md
-  - Phase 1: Configuration & Core Components (Completed)
-  - Phase 2: Integration with GRPO (Completed) 
-  - Phase 3: Experiment Scripts (Completed)
-  - Phase 4: Testing (Pending)
+
 
 ## Development Workflow
 
@@ -227,45 +220,3 @@ end
 - Mark completed tasks with ✅ in the roadmap
 - Add reference to the task file (e.g., `See: /tasks/001-db.md`)
 
-## Implementation Summary
-
-### Completed Implementation (January 2025)
-
-**Phase 1: Configuration & Scaffolding**
-- ✅ Extended `examples/config.yaml` with `grpo_variant` selector (`standard`, `pge`, `cgsg`)
-- ✅ Added `grpo_variant`, `pge_config`, and `cgsg_config` to `AlgorithmConfig` in `verl/trainer/config.py`
-- ✅ Created `verl/utils/perturbations.py` with token substitution, deletion, and insertion functions
-
-**Phase 2: PGE (Perturbed Golden Ensemble)**
-- ✅ Added `_apply_pge_variant()` method in `verl/trainer/ray_trainer.py`
-- ✅ Implemented golden sample selection based on highest reward per prompt
-- ✅ Added perturbation generation for golden samples using perturbation methods
-- ✅ Integrated PGE processing into `_make_batch_data()` flow
-- ✅ Uses standard GRPO advantage computation on perturbed batch
-
-**Phase 3: CGSG (Contrastive Golden Sample Group)**  
-- ✅ Added `_apply_cgsg_variant()` method in `verl/trainer/ray_trainer.py`
-- ✅ Implemented golden sample + hard negatives selection
-- ✅ Added `compute_cgsg_contrastive_advantage()` function for contrastive loss
-- ✅ Modified `compute_advantage()` to handle CGSG with both loss types
-- ✅ Supports `normalized_advantage` (using standard GRPO) and `contrastive_loss`
-
-**Phase 4: Experimentation**
-- ✅ Created `examples/qwen2_5_vl_7b_geo3k_pge_grpo.sh`
-- ✅ Created `examples/qwen2_5_vl_7b_geo3k_cgsg_grpo.sh`
-- ✅ Created `examples/qwen2_5_vl_7b_geo3k_cgsg_contrastive_grpo.sh`
-- 🔄 Phase 4.3: Experiments pending execution
-
-### Usage
-
-Run experiments with:
-```bash
-# Standard GRPO (baseline)
-bash examples/qwen2_5_vl_7b_geo3k_grpo.sh
-
-# PGE variant
-bash examples/qwen2_5_vl_7b_geo3k_pge_grpo.sh
-
-# CGSG variant  
-bash examples/qwen2_5_vl_7b_geo3k_cgsg_grpo.sh
-```

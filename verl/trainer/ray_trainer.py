@@ -863,33 +863,36 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
             batch.batch["token_level_scores"] = reward_tensor
         
         # Compute costs for each trajectory
-        visual_costs = torch.zeros(len(batch))
-        text_costs = torch.zeros(len(batch))
+        from ..utils.pdb_actions import estimate_trajectory_costs
         
-        # Estimate costs based on response length and visual processing
-        # This is a simplified version - in full implementation, track actual actions
+        # Get response IDs for cost computation
         response_ids = batch.batch.get("responses", batch.batch.get("input_ids"))
         
-        for i in range(len(batch)):
-            # Text cost: proportional to response length
-            if response_ids is not None:
-                response_length = (response_ids[i] != self.tokenizer.pad_token_id).sum().item()
-                text_costs[i] = response_length * pdb_config.get("cost_per_text_token", 1)
-            
-            # Visual cost: estimate based on multi-modal data presence
-            if "multi_modal_data" in batch.non_tensor_batch:
-                mm_data = batch.non_tensor_batch["multi_modal_data"][i]
-                if mm_data is not None:
-                    # Simplified: assume fixed visual processing cost
-                    visual_costs[i] = pdb_config.get("cost_crop_fixed", 32)
+        if response_ids is not None:
+            # Use the utility function to estimate costs
+            visual_costs, text_costs = estimate_trajectory_costs(
+                response_ids, self.tokenizer, pdb_config
+            )
+            visual_costs = visual_costs.to(response_ids.device)
+            text_costs = text_costs.to(response_ids.device)
+        else:
+            # Fallback if no responses
+            visual_costs = torch.zeros(len(batch), device=batch.batch["token_level_scores"].device)
+            text_costs = torch.zeros(len(batch), device=batch.batch["token_level_scores"].device)
         
         # Modify rewards with dual penalties
         modified_rewards = batch.batch["token_level_scores"].clone()
         
         # Apply penalty: r' = r - λ_v * visual_cost - λ_t * text_cost
-        for i in range(len(batch)):
-            penalty = lambda_v * visual_costs[i] + lambda_t * text_costs[i]
-            modified_rewards[i] = modified_rewards[i] - penalty
+        # Expand costs to match token-level reward shape if needed
+        if len(modified_rewards.shape) > 1:
+            # Token-level rewards: (batch_size, seq_len)
+            penalty = (lambda_v * visual_costs + lambda_t * text_costs).unsqueeze(-1)
+            modified_rewards = modified_rewards - penalty
+        else:
+            # Response-level rewards: (batch_size,)
+            penalty = lambda_v * visual_costs + lambda_t * text_costs
+            modified_rewards = modified_rewards - penalty
         
         # Update batch with modified rewards
         batch.batch["token_level_scores_original"] = batch.batch["token_level_scores"]

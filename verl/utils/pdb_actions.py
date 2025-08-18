@@ -1,236 +1,182 @@
-# Copyright 2024 Bytedance Ltd. and/or its affiliates
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 """
-PDB (Primal-Dual Budgeter) action definitions for multimodal reasoning
+Primal-Dual Budgeter (PDB) Action Space
+
+Defines the simplified action space with ANS (direct answer) and TEXT-k (CoT).
+According to ROADMAP: "action set当前只包含直接回答和cot两种形式"
 """
 
-from dataclasses import dataclass
-from enum import Enum, auto
-from typing import List, Optional, Tuple, Union
 import torch
+from typing import Dict, List, Tuple, Optional
+from enum import Enum
 
 
 class ActionType(Enum):
-    """Types of actions available in PDB"""
-    ANS = auto()      # Direct answer
-    TEXT = auto()     # Generate text/CoT tokens
-    CROP = auto()     # Crop region of image
-    DRAW = auto()     # Draw primitives on image
-    TOOL = auto()     # Use external tools (OCR, detection, etc.)
-    STOP = auto()     # Stop and return current answer
+    """Simplified action types for PDB."""
+    ANS = "direct_answer"      # Direct answer without CoT
+    TEXT_COT = "chain_of_thought"  # Chain-of-thought reasoning
 
 
-class DrawPrimitive(Enum):
-    """Types of drawing primitives"""
-    LINE = auto()          # Draw a line
-    PARALLEL = auto()      # Draw parallel lines
-    PERPENDICULAR = auto() # Draw perpendicular lines
-    ANGLE = auto()         # Mark/measure angle
-    MEASURE = auto()       # Measure distance
-    CIRCLE = auto()        # Draw circle
-    RECTANGLE = auto()     # Draw rectangle
-    ARROW = auto()         # Draw arrow/vector
-
-
-class ToolType(Enum):
-    """Types of external tools"""
-    OCR = auto()           # Optical character recognition
-    DETECT = auto()        # Object detection
-    TABLE = auto()         # Table extraction
-    FORMULA = auto()       # Formula recognition
-
-
-@dataclass
 class Action:
-    """Base action class"""
-    action_type: ActionType
-    metadata: dict = None
+    """Represents a single action in PDB."""
     
-    def __post_init__(self):
-        if self.metadata is None:
-            self.metadata = {}
-
-
-@dataclass
-class AnswerAction(Action):
-    """Direct answer action"""
-    def __init__(self):
-        super().__init__(ActionType.ANS)
-
-
-@dataclass
-class TextAction(Action):
-    """Generate text/CoT tokens"""
-    num_tokens: int = 10  # Number of tokens to generate
+    def __init__(self, action_type: ActionType, text_tokens: int = 0):
+        """
+        Initialize an action.
+        
+        Args:
+            action_type: Type of action (ANS or TEXT_COT)
+            text_tokens: Number of text tokens for this action
+        """
+        self.action_type = action_type
+        self.text_tokens = text_tokens
+        
+    def get_visual_cost(self, config: Dict) -> float:
+        """
+        Get visual cost of this action.
+        For simplified version, both ANS and TEXT_COT have no additional visual cost.
+        
+        Args:
+            config: PDB configuration
+            
+        Returns:
+            Visual cost (0 for text-only actions)
+        """
+        return 0.0
     
-    def __init__(self, num_tokens: int = 10):
-        super().__init__(ActionType.TEXT)
-        self.num_tokens = num_tokens
-
-
-@dataclass
-class CropAction(Action):
-    """Crop a region of the image"""
-    bbox: Tuple[float, float, float, float]  # (x1, y1, x2, y2) normalized coordinates
+    def get_text_cost(self, config: Dict) -> float:
+        """
+        Get text cost of this action.
+        
+        Args:
+            config: PDB configuration
+            
+        Returns:
+            Text cost in token-equivalent units
+        """
+        cost_per_token = config.get("cost_per_text_token", 1.0)
+        return self.text_tokens * cost_per_token
     
-    def __init__(self, bbox: Tuple[float, float, float, float]):
-        super().__init__(ActionType.CROP)
-        self.bbox = bbox
-        self.metadata = {"bbox": bbox}
-
-
-@dataclass
-class DrawAction(Action):
-    """Draw primitives on image"""
-    primitive: DrawPrimitive
-    params: dict  # Parameters specific to the primitive
-    
-    def __init__(self, primitive: DrawPrimitive, params: dict):
-        super().__init__(ActionType.DRAW)
-        self.primitive = primitive
-        self.params = params
-        self.metadata = {"primitive": primitive.name, "params": params}
-
-
-@dataclass
-class ToolAction(Action):
-    """Use external tool"""
-    tool: ToolType
-    region: Optional[Tuple[float, float, float, float]] = None  # Optional region to apply tool
-    
-    def __init__(self, tool: ToolType, region: Optional[Tuple[float, float, float, float]] = None):
-        super().__init__(ActionType.TOOL)
-        self.tool = tool
-        self.region = region
-        self.metadata = {"tool": tool.name, "region": region}
-
-
-@dataclass
-class StopAction(Action):
-    """Stop and return current answer"""
-    def __init__(self):
-        super().__init__(ActionType.STOP)
+    def __repr__(self):
+        return f"Action({self.action_type.value}, tokens={self.text_tokens})"
 
 
 class ActionSpace:
-    """Manages the space of available actions"""
+    """Manages the action space for PDB."""
     
-    def __init__(self, config: dict):
+    def __init__(self, config: Dict):
+        """
+        Initialize action space.
+        
+        Args:
+            config: PDB configuration
+        """
         self.config = config
-        self.enable_crop = config.get("enable_crop", True)
-        self.enable_draw = config.get("enable_draw", True)
-        self.enable_tool = config.get("enable_tool", False)
-        self.max_crop_candidates = config.get("max_crop_candidates", 5)
-        self.max_draw_primitives = config.get("max_draw_primitives", 3)
-    
-    def get_available_actions(
-        self,
-        state: dict,
-        image_features: Optional[torch.Tensor] = None
-    ) -> List[Action]:
-        """Get list of available actions given current state"""
+        
+        # Define typical token counts for different action types
+        # These are estimates - actual counts depend on generation
+        self.ans_tokens = 50  # Short direct answer
+        self.cot_tokens = 200  # Longer CoT reasoning
+        
+    def get_available_actions(self) -> List[Action]:
+        """
+        Get list of available actions.
+        
+        Returns:
+            List of available actions
+        """
         actions = []
         
-        # Always available actions
-        actions.append(AnswerAction())
-        actions.append(StopAction())
+        # Direct answer action
+        actions.append(Action(ActionType.ANS, self.ans_tokens))
         
-        # Text generation actions
-        for num_tokens in [5, 10, 20]:
-            actions.append(TextAction(num_tokens))
-        
-        # Crop actions
-        if self.enable_crop and image_features is not None:
-            crop_candidates = self._generate_crop_candidates(state, image_features)
-            actions.extend(crop_candidates[:self.max_crop_candidates])
-        
-        # Draw actions
-        if self.enable_draw:
-            draw_candidates = self._generate_draw_candidates(state)
-            actions.extend(draw_candidates[:self.max_draw_primitives])
-        
-        # Tool actions
-        if self.enable_tool:
-            tool_candidates = self._generate_tool_candidates(state)
-            actions.extend(tool_candidates)
+        # Chain-of-thought action
+        actions.append(Action(ActionType.TEXT_COT, self.cot_tokens))
         
         return actions
     
-    def _generate_crop_candidates(
-        self,
-        state: dict,
-        image_features: torch.Tensor
-    ) -> List[CropAction]:
-        """Generate candidate crop regions"""
-        candidates = []
+    def estimate_action_gain(self, action: Action, context: Optional[Dict] = None) -> float:
+        """
+        Estimate information gain from an action.
+        Simplified version - returns fixed estimates.
         
-        # Generate grid-based crops
-        grid_sizes = [(2, 2), (3, 3)]
-        for rows, cols in grid_sizes:
-            for i in range(rows):
-                for j in range(cols):
-                    x1 = j / cols
-                    y1 = i / rows
-                    x2 = (j + 1) / cols
-                    y2 = (i + 1) / rows
-                    candidates.append(CropAction((x1, y1, x2, y2)))
+        Args:
+            action: The action to evaluate
+            context: Optional context for gain estimation
+            
+        Returns:
+            Estimated information gain
+        """
+        # Simple heuristic: CoT provides more information gain than direct answer
+        if action.action_type == ActionType.TEXT_COT:
+            return 0.8  # Higher gain from reasoning
+        elif action.action_type == ActionType.ANS:
+            return 0.4  # Lower gain from direct answer
+        else:
+            return 0.0
+            
+    def select_best_action(self, pdb_controller, context: Optional[Dict] = None) -> Tuple[Optional[Action], float]:
+        """
+        Select best action based on gain minus cost.
         
-        # Add attention-based crops if available
-        if "attention_map" in state:
-            # Extract high-attention regions
-            pass
+        Args:
+            pdb_controller: PDBController instance for computing action values
+            context: Optional context for action selection
+            
+        Returns:
+            (best_action, action_value) or (None, value) if should stop
+        """
+        actions = self.get_available_actions()
         
-        return candidates
+        best_action = None
+        best_value = float('-inf')
+        
+        for action in actions:
+            # Estimate gain and costs
+            gain = self.estimate_action_gain(action, context)
+            visual_cost = action.get_visual_cost(self.config)
+            text_cost = action.get_text_cost(self.config)
+            
+            # Compute action value
+            value = pdb_controller.compute_action_value(gain, visual_cost, text_cost)
+            
+            if value > best_value:
+                best_value = value
+                best_action = action
+                
+        # Check stopping condition
+        if pdb_controller.should_stop(best_value):
+            return None, best_value
+            
+        return best_action, best_value
+
+
+def estimate_trajectory_costs(responses: torch.Tensor, tokenizer, config: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Estimate visual and text costs for generated trajectories.
     
-    def _generate_draw_candidates(self, state: dict) -> List[DrawAction]:
-        """Generate candidate drawing actions"""
-        candidates = []
+    Args:
+        responses: Generated response token IDs (batch_size, seq_len)
+        tokenizer: Tokenizer for decoding
+        config: PDB configuration
         
-        # Generate basic drawing primitives
-        if "geometry_context" in state:
-            # Add geometry-specific primitives
-            candidates.append(DrawAction(
-                DrawPrimitive.ANGLE,
-                {"vertices": [(0.3, 0.3), (0.5, 0.5), (0.7, 0.3)]}
-            ))
-            candidates.append(DrawAction(
-                DrawPrimitive.PARALLEL,
-                {"lines": [((0.2, 0.3), (0.8, 0.3)), ((0.2, 0.6), (0.8, 0.6))]}
-            ))
-        
-        # Add measurement primitives
-        candidates.append(DrawAction(
-            DrawPrimitive.MEASURE,
-            {"points": [(0.2, 0.5), (0.8, 0.5)]}
-        ))
-        
-        return candidates
+    Returns:
+        (visual_costs, text_costs): Cost tensors for each trajectory
+    """
+    batch_size = responses.shape[0]
+    visual_costs = torch.zeros(batch_size)
+    text_costs = torch.zeros(batch_size)
     
-    def _generate_tool_candidates(self, state: dict) -> List[ToolAction]:
-        """Generate candidate tool actions"""
-        candidates = []
+    cost_per_text_token = config.get("cost_per_text_token", 1.0)
+    
+    for i in range(batch_size):
+        # Count actual response tokens (non-padding)
+        response = responses[i]
+        valid_tokens = (response != tokenizer.pad_token_id).sum().item()
         
-        # OCR tool
-        if "text_regions" in state:
-            candidates.append(ToolAction(ToolType.OCR))
+        # For simplified version: only text cost, no visual cost
+        text_costs[i] = valid_tokens * cost_per_text_token
         
-        # Detection tool
-        if "objects_needed" in state:
-            candidates.append(ToolAction(ToolType.DETECT))
+        # Visual cost is 0 for text-only actions
+        visual_costs[i] = 0.0
         
-        # Table tool
-        if "table_present" in state:
-            candidates.append(ToolAction(ToolType.TABLE))
-        
-        return candidates
+    return visual_costs, text_costs

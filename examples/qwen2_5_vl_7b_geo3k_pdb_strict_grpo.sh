@@ -4,7 +4,7 @@ set -x
 
 export PYTHONUNBUFFERED=1
 
-MODEL_PATH=Qwen/Qwen2.5-VL-7B-Instruct  # replace it with your local file path
+MODEL_PATH=Qwen/Qwen2.5-VL-3B-Instruct  # replace it with your local file path
 
 # PDB variant with strict SLA mode (lower budgets, higher penalties)
 python3 -m verl.trainer.main \
