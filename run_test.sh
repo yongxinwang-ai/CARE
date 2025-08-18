@@ -10,6 +10,4 @@
 
 conda activate easy_r1
 
-bash examples/qwen2_5_vl_7b_geo3k_cgsg_grpo.sh
-
-bash examples/qwen2_5_vl_7b_geo3k_pge_grpo.sh
+bash examples/qwen2_5_vl_7b_geo3k_cgsg_contrastive_grpo.sh

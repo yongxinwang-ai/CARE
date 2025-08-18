@@ -167,26 +167,36 @@ def compute_cgsg_contrastive_advantage(
         
         # Find golden sample (label = 1)
         golden_mask = group_labels == 1
-        golden_score = group_scores[golden_mask].item()
+        golden_idx = golden_mask.nonzero(as_tuple=True)[0]
         
+        if len(golden_idx) == 0:
+            continue  # Skip if no golden sample
+            
         # Find negative samples (label = 0)
         negative_mask = group_labels == 0
-        negative_scores = group_scores[negative_mask]
+        negative_idx = negative_mask.nonzero(as_tuple=True)[0]
         
-        # Compute softmax normalization for contrastive loss
-        # A_golden = log(exp(r_golden) / (exp(r_golden) + sum(exp(r_neg))))
-        exp_golden = torch.exp(golden_score)
-        exp_negatives = torch.exp(negative_scores)
-        denominator = exp_golden + exp_negatives.sum()
+        if len(negative_idx) == 0:
+            # Only golden sample, give it advantage of 1
+            advantages[i, golden_idx[0]] = 1.0
+            continue
         
-        # Golden sample gets positive advantage
-        advantages[i][golden_mask] = torch.log(exp_golden / (denominator + eps))
+        # Compute stable softmax using log-sum-exp trick for numerical stability
+        max_score = group_scores.max()
+        exp_scores = torch.exp(group_scores - max_score)
         
-        # Negative samples get negative advantages
-        if negative_mask.any():
-            for j, is_neg in enumerate(negative_mask):
-                if is_neg:
-                    advantages[i][j] = -torch.log(exp_negatives[negative_mask[:j+1].sum()-1] / (denominator + eps))
+        # Compute log probabilities (which serve as initial advantages)
+        log_probs = torch.log(exp_scores / (exp_scores.sum() + eps))
+        
+        # Use normalized advantages for more stable training
+        # This helps prevent extreme gradients
+        mean_log_prob = log_probs.mean()
+        std_log_prob = log_probs.std() + eps
+        normalized_advantages = (log_probs - mean_log_prob) / std_log_prob
+        
+        # Assign normalized advantages
+        for j in range(len(group_scores)):
+            advantages[i, j] = normalized_advantages[j].item()
     
     # Flatten back to batch dimension
     advantages = advantages.view(-1)
@@ -802,10 +812,32 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
         
         # Create UIDs for new batch
         new_uids = []
+        samples_per_group_list = []  # Track actual samples per group
+        
         for i in range(batch_size):
+            # Get actual count for this group
+            # Note: At this stage we have token_level_scores, not rewards yet
+            golden_reward = batch.batch["token_level_scores"][i].sum().item()
+            rewards = batch.batch["token_level_scores"].sum(dim=-1)
+            
+            # Find negative samples for this group
+            negative_mask = rewards < golden_reward
+            negative_indices = negative_mask.nonzero(as_tuple=True)[0]
+            
+            # Select up to num_negatives
+            num_to_select = min(cgsg_config.get("num_negatives", 4), len(negative_indices))
+            if num_to_select > 0:
+                sorted_indices = negative_indices[rewards[negative_indices].argsort()]
+                selected_negatives = sorted_indices[:num_to_select]
+                actual_samples = 1 + len(selected_negatives)
+            else:
+                actual_samples = 1  # Just golden sample
+            
+            samples_per_group_list.append(actual_samples)
+            
             # Each group gets same UID for GRPO advantage computation
             group_uid = str(uuid.uuid4())
-            for _ in range(1 + len(negative_indices_local)):
+            for _ in range(actual_samples):
                 new_uids.append(group_uid)
         
         # Create new non-tensor batch
@@ -831,7 +863,9 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
         new_batch.meta_info["cgsg_applied"] = True
         new_batch.meta_info["loss_type"] = cgsg_config["loss_type"]
         new_batch.meta_info["num_groups"] = batch_size
-        new_batch.meta_info["samples_per_group"] = 1 + len(negative_indices_local)
+        # Use the most common samples_per_group for reshaping (should be consistent)
+        new_batch.meta_info["samples_per_group"] = max(set(samples_per_group_list), key=samples_per_group_list.count)
+        new_batch.meta_info["samples_per_group_list"] = samples_per_group_list
         
         return new_batch
 
