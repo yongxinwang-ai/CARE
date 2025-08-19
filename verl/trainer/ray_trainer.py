@@ -814,24 +814,27 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
         new_uids = []
         samples_per_group_list = []  # Track actual samples per group
         
+        # Correctly track samples per group based on actual batch construction
         for i in range(batch_size):
-            # Get actual count for this group
-            # Note: At this stage we have token_level_scores, not rewards yet
-            golden_reward = batch.batch["token_level_scores"][i].sum().item()
-            rewards = batch.batch["token_level_scores"].sum(dim=-1)
+            # Count how many samples were actually added for this group
+            # We added 1 golden sample, then check how many negatives were added
+            start_idx = i * n_rollouts
+            end_idx = (i + 1) * n_rollouts
+            prompt_rewards = response_rewards[start_idx:end_idx]
             
-            # Find negative samples for this group
-            negative_mask = rewards < golden_reward
-            negative_indices = negative_mask.nonzero(as_tuple=True)[0]
+            # Select golden sample (highest reward)
+            golden_idx_local = torch.argmax(prompt_rewards).item()
             
-            # Select up to num_negatives
-            num_to_select = min(cgsg_config.get("num_negatives", 4), len(negative_indices))
-            if num_to_select > 0:
-                sorted_indices = negative_indices[rewards[negative_indices].argsort()]
-                selected_negatives = sorted_indices[:num_to_select]
-                actual_samples = 1 + len(selected_negatives)
+            # Count negative samples that were actually added
+            if negative_selection == "lowest_reward":
+                sorted_indices = torch.argsort(prompt_rewards)
+                negative_count = 0
+                for idx in sorted_indices:
+                    if idx != golden_idx_local and negative_count < num_negatives:
+                        negative_count += 1
+                actual_samples = 1 + negative_count  # 1 golden + negatives
             else:
-                actual_samples = 1  # Just golden sample
+                actual_samples = 1  # Just golden sample if unknown strategy
             
             samples_per_group_list.append(actual_samples)
             

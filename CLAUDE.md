@@ -58,6 +58,7 @@ make test
 ## Development Notes
 
 - See @ROADMAP.md to check the tasks.
+- use python-expert and pytorch-expert to implement after planning the tasks.
 - The project uses Ray for distributed training
 - Supports multiple vision-language models (Qwen2/2.5-VL)
 - Configuration is based on OmegaConf with hierarchical settings
