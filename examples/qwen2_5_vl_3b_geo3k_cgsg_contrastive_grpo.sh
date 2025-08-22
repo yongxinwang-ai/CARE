@@ -16,4 +16,5 @@ python3 -m verl.trainer.main \
     algorithm.grpo_variant=cgsg \
     algorithm.cgsg_config.num_negatives=4 \
     algorithm.cgsg_config.negative_selection_strategy=lowest_reward \
-    algorithm.cgsg_config.loss_type=contrastive_loss
+    algorithm.cgsg_config.loss_type=contrastive_loss \
+    algorithm.cgsg_config.reward_threshold=0.99

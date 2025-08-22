@@ -738,8 +738,8 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
     def _apply_cgsg_variant(self, batch: DataProto) -> DataProto:
         """Apply Contrastive Golden Sample Group (CGSG) variant processing.
         
-        1. Select golden samples (highest reward per prompt)
-        2. Select hard negatives (lowest rewards per prompt)
+        1. Select golden samples (all samples with reward=1, or highest reward if none)
+        2. Select hard negatives (samples with reward<1)
         3. Construct new batch with golden + negatives
         """
         cgsg_config = self.config.algorithm.cgsg_config
@@ -774,28 +774,44 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
             end_idx = (i + 1) * n_rollouts
             prompt_rewards = response_rewards[start_idx:end_idx]
             
-            # Select golden sample (highest reward)
-            golden_idx_local = torch.argmax(prompt_rewards).item()
-            golden_idx = start_idx + golden_idx_local
+            # Identify golden samples: all with reward >= threshold, or highest if none
+            reward_threshold = cgsg_config.get("reward_threshold", 0.99)  # Consider rewards >= threshold as correct
+            golden_mask = prompt_rewards >= reward_threshold
             
-            # Add golden sample
-            new_responses.append(batch.batch["responses"][golden_idx])
-            new_prompts.append(batch.batch["prompts"][golden_idx])
-            new_input_ids.append(batch.batch["input_ids"][golden_idx])
-            new_attention_masks.append(batch.batch["attention_mask"][golden_idx])
-            new_position_ids.append(batch.batch["position_ids"][golden_idx])
-            new_response_masks.append(batch.batch["response_mask"][golden_idx])
-            cgsg_labels.append(1.0)  # Golden sample label
+            if golden_mask.any():
+                # Use all samples with reward >= threshold as golden samples
+                golden_indices_local = torch.where(golden_mask)[0].tolist()
+            else:
+                # No perfect samples, use the single highest reward as golden
+                golden_idx_local = torch.argmax(prompt_rewards).item()
+                golden_indices_local = [golden_idx_local]
             
-            # Select negative samples
+            # Add all golden samples
+            for golden_idx_local in golden_indices_local:
+                golden_idx = start_idx + golden_idx_local
+                new_responses.append(batch.batch["responses"][golden_idx])
+                new_prompts.append(batch.batch["prompts"][golden_idx])
+                new_input_ids.append(batch.batch["input_ids"][golden_idx])
+                new_attention_masks.append(batch.batch["attention_mask"][golden_idx])
+                new_position_ids.append(batch.batch["position_ids"][golden_idx])
+                new_response_masks.append(batch.batch["response_mask"][golden_idx])
+                cgsg_labels.append(1.0)  # Golden sample label
+            
+            # Select negative samples (only from samples with reward < threshold)
             if negative_selection == "lowest_reward":
-                # Sort rewards and get indices
-                sorted_indices = torch.argsort(prompt_rewards)
-                # Select lowest rewards, excluding golden sample
-                negative_indices_local = []
-                for idx in sorted_indices:
-                    if idx != golden_idx_local and len(negative_indices_local) < num_negatives:
-                        negative_indices_local.append(idx.item())
+                # Get indices of non-golden samples
+                all_indices = list(range(len(prompt_rewards)))
+                non_golden_indices = [idx for idx in all_indices if idx not in golden_indices_local]
+                
+                # Only select from samples with reward < threshold as negatives
+                negative_candidates = []
+                for idx in non_golden_indices:
+                    if prompt_rewards[idx] < reward_threshold:
+                        negative_candidates.append((idx, prompt_rewards[idx].item()))
+                
+                # Sort by reward and select lowest ones
+                negative_candidates.sort(key=lambda x: x[1])
+                negative_indices_local = [idx for idx, _ in negative_candidates[:num_negatives]]
             else:
                 raise ValueError(f"Unknown negative selection strategy: {negative_selection}")
             
@@ -816,26 +832,31 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
         
         # Correctly track samples per group based on actual batch construction
         for i in range(batch_size):
-            # Count how many samples were actually added for this group
-            # We added 1 golden sample, then check how many negatives were added
+            # Get rewards for this prompt's rollouts
             start_idx = i * n_rollouts
             end_idx = (i + 1) * n_rollouts
             prompt_rewards = response_rewards[start_idx:end_idx]
             
-            # Select golden sample (highest reward)
-            golden_idx_local = torch.argmax(prompt_rewards).item()
+            # Count golden samples
+            reward_threshold = cgsg_config.get("reward_threshold", 0.99)
+            golden_mask = prompt_rewards >= reward_threshold
+            
+            if golden_mask.any():
+                num_golden = golden_mask.sum().item()
+            else:
+                num_golden = 1  # Single highest reward sample
             
             # Count negative samples that were actually added
             if negative_selection == "lowest_reward":
-                sorted_indices = torch.argsort(prompt_rewards)
-                negative_count = 0
-                for idx in sorted_indices:
-                    if idx != golden_idx_local and negative_count < num_negatives:
-                        negative_count += 1
-                actual_samples = 1 + negative_count  # 1 golden + negatives
+                # Count samples with reward < threshold
+                negative_mask = prompt_rewards < reward_threshold
+                num_negative_candidates = negative_mask.sum().item()
+                # Actual negatives is min of candidates and requested num_negatives
+                num_actual_negatives = min(num_negative_candidates, num_negatives)
             else:
-                actual_samples = 1  # Just golden sample if unknown strategy
+                num_actual_negatives = 0
             
+            actual_samples = num_golden + num_actual_negatives
             samples_per_group_list.append(actual_samples)
             
             # Each group gets same UID for GRPO advantage computation

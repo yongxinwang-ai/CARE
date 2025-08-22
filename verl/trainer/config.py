@@ -112,7 +112,8 @@ class AlgorithmConfig:
     cgsg_config: dict = field(default_factory=lambda: {
         "num_negatives": 4,
         "negative_selection_strategy": "lowest_reward",
-        "loss_type": "normalized_advantage"
+        "loss_type": "normalized_advantage",
+        "reward_threshold": 0.99  # Samples with reward >= this are considered golden
     })
     """CGSG configuration"""
 
