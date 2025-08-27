@@ -7,7 +7,7 @@ export PYTHONUNBUFFERED=1
 MODEL_PATH=Qwen/Qwen2.5-VL-7B-Instruct  # replace it with your local file path
 
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-EXPERIMENT_NAME="qwen2_5_vl_7b_geo_grpo_${TIMESTAMP}"
+EXPERIMENT_NAME="qwen2_5_vl_7b_geo_cgsg_grpo_${TIMESTAMP}"
 
 python3 -m verl.trainer.main \
     config=examples/config.yaml \
@@ -15,4 +15,9 @@ python3 -m verl.trainer.main \
     data.val_files=hiyouga/geometry3k@test \
     worker.actor.model.model_path=${MODEL_PATH} \
     trainer.experiment_name=${EXPERIMENT_NAME} \
-    trainer.n_gpus_per_node=8
+    trainer.n_gpus_per_node=8 \
+    algorithm.grpo_variant=cgsg \
+    algorithm.cgsg_config.num_negatives=4 \
+    algorithm.cgsg_config.negative_selection_strategy=lowest_reward \
+    algorithm.cgsg_config.loss_type=normalized_advantage \
+    algorithm.cgsg_config.reward_threshold=0.99
