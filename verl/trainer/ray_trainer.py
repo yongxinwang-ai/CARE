@@ -569,10 +569,17 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
         3. Construct new batch with golden + perturbations
         4. Re-evaluate rewards for the new batch
         """
+        import uuid
+        import numpy as np
         from ..utils.perturbations import substitute_tokens, delete_tokens, insert_tokens
+        from ..utils import torch_functional as VF
+        from tensordict import TensorDict
         
         pge_config = self.config.algorithm.pge_config
         n_rollouts = self.config.worker.rollout.n
+        
+        # Get pad token ID early as it's needed throughout
+        pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
         
         # Get rewards if not already computed
         if "token_level_scores" not in batch.batch:
@@ -593,8 +600,23 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
         new_position_ids = []
         new_response_masks = []
         
-        vocab_size = len(self.tokenizer)
-        special_token_ids = self.tokenizer.all_special_ids if hasattr(self.tokenizer, 'all_special_ids') else []
+        # Store original data we need to preserve
+        original_non_tensor_batch = []
+        
+        vocab_size = self.tokenizer.vocab_size
+        special_token_ids = [self.tokenizer.pad_token_id, self.tokenizer.eos_token_id, 
+                            self.tokenizer.bos_token_id] if self.tokenizer else []
+        
+        # Add image token ID for vision-language models like Qwen2-VL
+        if hasattr(self.tokenizer, 'convert_tokens_to_ids'):
+            try:
+                image_token_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+                if image_token_id is not None:
+                    special_token_ids.append(image_token_id)
+            except:
+                pass  # Not a VL model or doesn't have image tokens
+        
+        special_token_ids = [t for t in special_token_ids if t is not None]
         
         for i in range(batch_size):
             # Get rewards for this prompt's rollouts
@@ -606,7 +628,7 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
             golden_idx_local = torch.argmax(prompt_rewards).item()
             golden_idx = start_idx + golden_idx_local
             
-            # Extract golden sample
+            # Extract golden sample data
             golden_response = batch.batch["responses"][golden_idx]
             golden_prompt = batch.batch["prompts"][golden_idx]
             golden_input_ids = batch.batch["input_ids"][golden_idx]
@@ -614,22 +636,99 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
             golden_position_ids = batch.batch["position_ids"][golden_idx]
             golden_response_mask = batch.batch["response_mask"][golden_idx]
             
-            # Add golden sample to new batch
-            new_responses.append(golden_response)
-            new_prompts.append(golden_prompt)
-            new_input_ids.append(golden_input_ids)
-            new_attention_masks.append(golden_attention_mask)
-            new_position_ids.append(golden_position_ids)
-            new_response_masks.append(golden_response_mask)
+            # Ensure tensors are 1D (remove padding dimension if present)
+            if golden_response.dim() > 1:
+                golden_response = golden_response.squeeze(0)
+            if golden_prompt.dim() > 1:
+                golden_prompt = golden_prompt.squeeze(0)
+            if golden_input_ids.dim() > 1:
+                golden_input_ids = golden_input_ids.squeeze(0)
+            if golden_attention_mask.dim() > 1:
+                golden_attention_mask = golden_attention_mask.squeeze(0)
+            if golden_position_ids.dim() > 1:
+                golden_position_ids = golden_position_ids.squeeze(0)
+            if golden_response_mask.dim() > 1:
+                golden_response_mask = golden_response_mask.squeeze(0)
+            
+            # Find actual lengths (non-padded) and where response starts in input_ids
+            # For input_ids, we need to preserve the exact structure including image tokens
+            # For vision-language models, we need to be careful not to treat image tokens as padding
+            input_ids_nonpad = len(golden_input_ids)  # Start with full length
+            # Find the last non-pad token from the end
+            for idx in range(len(golden_input_ids) - 1, -1, -1):
+                if golden_input_ids[idx] != pad_token_id:
+                    input_ids_nonpad = idx + 1
+                    break
+            response_mask_nonpad = golden_response_mask[:input_ids_nonpad] if input_ids_nonpad > 0 else golden_response_mask
+            
+            # Find where the response starts in the input_ids (first position where response_mask is 1)
+            if (response_mask_nonpad == 1).any():
+                response_start_idx = (response_mask_nonpad == 1).nonzero(as_tuple=True)[0][0].item()
+            else:
+                # If no response mask, assume everything after prompt is response
+                # This is a fallback - in practice, response_mask should always have 1s
+                response_start_idx = len(golden_prompt) if len(golden_prompt) < input_ids_nonpad else input_ids_nonpad // 2
+            
+            # Extract the actual prompt and response from input_ids
+            golden_prompt_from_input = golden_input_ids[:response_start_idx] if response_start_idx > 0 else golden_input_ids[:1]
+            golden_response_from_input = golden_input_ids[response_start_idx:input_ids_nonpad] if response_start_idx < input_ids_nonpad else golden_input_ids[-1:]
+            
+            # Store original non-tensor data for golden sample
+            golden_non_tensor = {}
+            for key in batch.non_tensor_batch.keys():
+                if key in batch.non_tensor_batch and len(batch.non_tensor_batch[key]) > golden_idx:
+                    golden_non_tensor[key] = batch.non_tensor_batch[key][golden_idx]
+            
+            # Add golden sample to new batch (use the properly extracted versions)
+            golden_input_ids_nonpad = golden_input_ids[:input_ids_nonpad]
+            
+            # Count image tokens in the original to ensure preservation
+            if hasattr(self.tokenizer, 'convert_tokens_to_ids'):
+                try:
+                    image_token_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+                    original_image_count = (golden_input_ids_nonpad == image_token_id).sum().item()
+                    
+                    # Debug: Check if we're losing image tokens
+                    if original_image_count == 0 and "pixel_values" in batch.batch:
+                        # If we have pixel values but no image tokens, something is wrong
+                        # Use the original full input_ids without truncation
+                        golden_input_ids_nonpad = golden_input_ids
+                        golden_prompt_from_input = golden_input_ids[:response_start_idx] if response_start_idx > 0 else golden_input_ids
+                        golden_response_from_input = golden_input_ids[response_start_idx:] if response_start_idx > 0 else torch.tensor([], device=golden_input_ids.device)
+                        original_image_count = (golden_input_ids == image_token_id).sum().item()
+                except:
+                    original_image_count = 0
+            else:
+                original_image_count = 0
+            
+            # For compatibility with existing code, also extract prompt and response separately
+            # But preserve the original structure
+            new_responses.append(golden_response_from_input)
+            new_prompts.append(golden_prompt_from_input)
+            new_input_ids.append(golden_input_ids_nonpad)
+            
+            # Create fresh masks for the non-padded sequence
+            nonpad_len = len(golden_input_ids_nonpad)
+            new_attention_masks.append(torch.ones(nonpad_len, dtype=golden_attention_mask.dtype, device=golden_attention_mask.device))
+            new_position_ids.append(torch.arange(nonpad_len, dtype=golden_position_ids.dtype, device=golden_position_ids.device))
+            resp_mask = torch.zeros(nonpad_len, dtype=golden_response_mask.dtype, device=golden_response_mask.device)
+            resp_mask[response_start_idx:] = 1
+            new_response_masks.append(resp_mask)
+            
+            original_non_tensor_batch.append(golden_non_tensor)
             
             # Generate perturbations
             num_perturbations = pge_config["num_perturbations"]
             perturbation_methods = pge_config["perturbation_methods"]
             perturbation_strength = pge_config["perturbation_strength"]
             
+            # Use the response extracted from input_ids to preserve structure
+            response_only = golden_response_from_input.clone()
+            
             for _ in range(num_perturbations):
-                # Apply perturbations to golden response
-                perturbed_response = golden_response.tolist()
+                # Apply perturbations only to the response part
+                perturbed_response = response_only.cpu().tolist() if torch.is_tensor(response_only) else response_only.tolist()
+                original_response_length = len(perturbed_response)
                 
                 for method in perturbation_methods:
                     if method == "token_substitute":
@@ -638,100 +737,218 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
                         )
                     elif method == "token_delete":
                         perturbed_response = delete_tokens(
-                            perturbed_response, perturbation_strength, special_token_ids
+                            perturbed_response, perturbation_strength, special_token_ids, min_length=5
                         )
                     elif method == "token_insert":
+                        # For insert, we can use padding token as neutral
+                        neutral_tokens = [self.tokenizer.pad_token_id] if self.tokenizer.pad_token_id else []
                         perturbed_response = insert_tokens(
-                            perturbed_response, perturbation_strength, None
+                            perturbed_response, perturbation_strength, neutral_tokens
                         )
                 
-                # Convert back to tensor and create full sequence
-                perturbed_response_tensor = torch.tensor(perturbed_response, device=golden_response.device)
+                # Ensure the perturbed response maintains at least the original length
+                # This prevents tensor size mismatches during training
+                if len(perturbed_response) < original_response_length:
+                    # Pad with EOS or PAD tokens to maintain length
+                    pad_token = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else pad_token_id
+                    perturbed_response.extend([pad_token] * (original_response_length - len(perturbed_response)))
                 
-                # Reconstruct full input_ids
-                perturbed_input_ids = torch.cat([golden_prompt, perturbed_response_tensor])
+                # Convert back to tensor
+                perturbed_response_tensor = torch.tensor(perturbed_response, dtype=golden_response_from_input.dtype, 
+                                                        device=golden_response_from_input.device)
                 
-                # Create attention mask and position IDs for perturbed sequence
-                perturbed_attention_mask = torch.ones_like(perturbed_input_ids)
-                perturbed_position_ids = torch.arange(len(perturbed_input_ids), device=golden_position_ids.device)
+                # Reconstruct full sequence (preserve the exact prompt structure with image tokens)
+                perturbed_input_ids = torch.cat([golden_prompt_from_input, perturbed_response_tensor])
                 
-                # Create response mask
-                perturbed_response_mask = torch.zeros_like(perturbed_input_ids)
-                perturbed_response_mask[len(golden_prompt):] = 1
+                # Verify image tokens are preserved in perturbed sequence
+                if hasattr(self.tokenizer, 'convert_tokens_to_ids'):
+                    try:
+                        image_token_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+                        perturbed_image_count = (perturbed_input_ids == image_token_id).sum().item()
+                        # If we lost image tokens, use the original golden input_ids instead
+                        if original_image_count > 0 and perturbed_image_count != original_image_count:
+                            # Fall back to using the original golden sample
+                            perturbed_input_ids = golden_input_ids_nonpad.clone()
+                    except:
+                        pass
+                
+                # Create proper masks for the perturbed sequence
+                seq_len = len(perturbed_input_ids)
+                perturbed_attention_mask = torch.ones(seq_len, dtype=golden_attention_mask.dtype, 
+                                                     device=golden_attention_mask.device)
+                perturbed_position_ids = torch.arange(seq_len, dtype=golden_position_ids.dtype,
+                                                     device=golden_position_ids.device)
+                
+                # Response mask: 0 for prompt, 1 for response
+                perturbed_response_mask = torch.zeros(seq_len, dtype=golden_response_mask.dtype,
+                                                     device=golden_response_mask.device)
+                perturbed_response_mask[len(golden_prompt_from_input):] = 1
                 
                 # Add to new batch
                 new_responses.append(perturbed_response_tensor)
-                new_prompts.append(golden_prompt)
+                new_prompts.append(golden_prompt_from_input)
                 new_input_ids.append(perturbed_input_ids)
                 new_attention_masks.append(perturbed_attention_mask)
                 new_position_ids.append(perturbed_position_ids)
                 new_response_masks.append(perturbed_response_mask)
+                
+                # Copy golden sample's non-tensor data for perturbed sample
+                original_non_tensor_batch.append(golden_non_tensor.copy())
         
-        # Pad sequences to same length before stacking
-        from ..utils import torch_functional as VF
+        # Pad all sequences to the same length
+        # Convert tensors to lists for padding
+        responses_list = [r.tolist() if torch.is_tensor(r) else r for r in new_responses]
+        prompts_list = [p.tolist() if torch.is_tensor(p) else p for p in new_prompts]
+        input_ids_list = [i.tolist() if torch.is_tensor(i) else i for i in new_input_ids]
         
-        pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        # Calculate the maximum length needed across all sequences
+        max_response_len = max(len(r) for r in responses_list) if responses_list else 0
+        max_prompt_len = max(len(p) for p in prompts_list) if prompts_list else 0
+        max_input_len = max(len(i) for i in input_ids_list) if input_ids_list else 0
         
-        # Pad responses
-        padded_responses = VF.pad_2d_list_to_length([r.tolist() if isinstance(r, torch.Tensor) else r for r in new_responses], 
-                                         pad_token_id, max_length=None)
-        padded_prompts = VF.pad_2d_list_to_length([p.tolist() if isinstance(p, torch.Tensor) else p for p in new_prompts], 
-                                       pad_token_id, max_length=None)
-        padded_input_ids = VF.pad_2d_list_to_length([i.tolist() if isinstance(i, torch.Tensor) else i for i in new_input_ids], 
-                                          pad_token_id, max_length=None)
+        # Also check mask lengths to ensure consistency
+        max_mask_len = max(len(m) for m in new_response_masks) if new_response_masks else 0
         
-        # Update masks and position IDs to match padded length
-        max_len = padded_input_ids.size(1)
+        # Use the maximum of all to ensure consistent padding across ALL tensors
+        target_seq_len = max(max_response_len, max_prompt_len, max_input_len, max_mask_len)
+        
+        # Pad all tensors to the same target length
+        padded_responses = VF.pad_2d_list_to_length(responses_list, pad_token_id, max_length=target_seq_len)
+        padded_prompts = VF.pad_2d_list_to_length(prompts_list, pad_token_id, max_length=target_seq_len)
+        padded_input_ids = VF.pad_2d_list_to_length(input_ids_list, pad_token_id, max_length=target_seq_len)
+        
+        # Use the same target length for mask padding
+        padded_seq_len = target_seq_len
+        
+        # Properly pad masks and position IDs
         padded_attention_masks = []
         padded_position_ids = []
         padded_response_masks = []
         
-        for i, orig_len in enumerate([len(seq) for seq in new_input_ids]):
-            # Attention mask: 1 for real tokens, 0 for padding
-            mask = torch.zeros(max_len, device=new_attention_masks[0].device)
-            mask[:orig_len] = 1
-            padded_attention_masks.append(mask)
+        for i in range(len(new_input_ids)):
+            orig_len = len(new_input_ids[i])
             
-            # Position IDs
-            pos_ids = torch.arange(max_len, device=new_position_ids[0].device)
+            # Get the original masks/position ids and ensure they're 1D
+            orig_att_mask = new_attention_masks[i]
+            orig_pos_ids = new_position_ids[i]
+            orig_resp_mask = new_response_masks[i]
+            
+            if orig_att_mask.dim() > 1:
+                orig_att_mask = orig_att_mask.squeeze()
+            if orig_pos_ids.dim() > 1:
+                orig_pos_ids = orig_pos_ids.squeeze()
+            if orig_resp_mask.dim() > 1:
+                orig_resp_mask = orig_resp_mask.squeeze()
+            
+            # Attention mask: 1 for real tokens, 0 for padding
+            att_mask = torch.zeros(padded_seq_len, dtype=orig_att_mask.dtype, 
+                                  device=orig_att_mask.device)
+            att_mask[:min(orig_len, len(orig_att_mask))] = orig_att_mask[:min(orig_len, len(orig_att_mask))]
+            padded_attention_masks.append(att_mask)
+            
+            # Position IDs: continue sequence for real tokens, 0 for padding
+            pos_ids = torch.zeros(padded_seq_len, dtype=orig_pos_ids.dtype,
+                                device=orig_pos_ids.device)
+            pos_ids[:min(orig_len, len(orig_pos_ids))] = orig_pos_ids[:min(orig_len, len(orig_pos_ids))]
             padded_position_ids.append(pos_ids)
             
-            # Response mask
-            resp_mask = torch.zeros(max_len, device=new_response_masks[0].device)
-            prompt_len = len(new_prompts[i])
-            resp_mask[prompt_len:orig_len] = 1
+            # Response mask: preserve original mask, 0 for padding
+            resp_mask = torch.zeros(padded_seq_len, dtype=orig_resp_mask.dtype,
+                                   device=orig_resp_mask.device)
+            resp_mask[:min(orig_len, len(orig_resp_mask))] = orig_resp_mask[:min(orig_len, len(orig_resp_mask))]
             padded_response_masks.append(resp_mask)
         
-        # Create UIDs for new batch
+        # Create UIDs for GRPO group processing
         new_uids = []
+        num_samples_per_group = 1 + num_perturbations
         for i in range(batch_size):
-            # Each group gets same UID for GRPO advantage computation
             group_uid = str(uuid.uuid4())
-            for _ in range(1 + num_perturbations):
+            for _ in range(num_samples_per_group):
                 new_uids.append(group_uid)
         
-        # Create new non-tensor batch
-        new_non_tensor_batch = batch.non_tensor_batch.copy()
-        new_non_tensor_batch["uid"] = np.array(new_uids, dtype=object)
+        # Prepare non-tensor batch
+        new_non_tensor_batch = {}
+        for key in batch.non_tensor_batch.keys():
+            if key == "uid":
+                new_non_tensor_batch[key] = np.array(new_uids, dtype=object)
+            else:
+                # Collect values from original_non_tensor_batch
+                values = []
+                for item in original_non_tensor_batch:
+                    if key in item:
+                        values.append(item[key])
+                    else:
+                        # Use default/placeholder value
+                        values.append(None)
+                new_non_tensor_batch[key] = np.array(values, dtype=object)
         
-        # Create new batch with golden samples and perturbations
+        # Create the new batch - preserve all existing keys
+        # Ensure all tensors have consistent dimensions
+        stacked_attention_masks = torch.stack(padded_attention_masks)
+        stacked_position_ids = torch.stack(padded_position_ids)
+        stacked_response_masks = torch.stack(padded_response_masks)
+        
+        # Verify all tensors have the same sequence length (dimension 1)
+        assert padded_responses.shape[1] == padded_prompts.shape[1], f"Response/prompt length mismatch: {padded_responses.shape[1]} vs {padded_prompts.shape[1]}"
+        assert padded_responses.shape[1] == padded_input_ids.shape[1], f"Response/input_ids length mismatch: {padded_responses.shape[1]} vs {padded_input_ids.shape[1]}"
+        assert padded_responses.shape[1] == stacked_attention_masks.shape[1], f"Response/attention_mask length mismatch: {padded_responses.shape[1]} vs {stacked_attention_masks.shape[1]}"
+        assert padded_responses.shape[1] == stacked_response_masks.shape[1], f"Response/response_mask length mismatch: {padded_responses.shape[1]} vs {stacked_response_masks.shape[1]}"
+        
+        new_batch_dict = {
+            "responses": padded_responses.to(batch.batch["responses"].device),
+            "prompts": padded_prompts.to(batch.batch["prompts"].device),
+            "input_ids": padded_input_ids.to(batch.batch["input_ids"].device),
+            "attention_mask": stacked_attention_masks,
+            "position_ids": stacked_position_ids,
+            "response_mask": stacked_response_masks,
+        }
+        
+        # Copy any additional keys from the original batch that we haven't explicitly handled
+        # This preserves image-related tensors for VL models
+        for key in batch.batch.keys():
+            if key not in new_batch_dict and key != "token_level_scores":
+                # For image/video related tensors, we need to duplicate them for each sample in the group
+                original_tensor = batch.batch[key]
+                if original_tensor is not None:
+                    new_tensor_list = []
+                    for i in range(batch_size):
+                        # Get the golden sample's tensor
+                        start_idx = i * n_rollouts
+                        golden_idx_local = torch.argmax(response_rewards[start_idx:start_idx + n_rollouts]).item()
+                        golden_idx = start_idx + golden_idx_local
+                        golden_tensor = original_tensor[golden_idx] if len(original_tensor) > golden_idx else None
+                        
+                        if golden_tensor is not None:
+                            # Add golden sample's tensor
+                            new_tensor_list.append(golden_tensor)
+                            # Duplicate for each perturbation
+                            for _ in range(num_perturbations):
+                                new_tensor_list.append(golden_tensor.clone() if torch.is_tensor(golden_tensor) else golden_tensor)
+                    
+                    if new_tensor_list:
+                        # Stack or concatenate based on the tensor type
+                        if torch.is_tensor(new_tensor_list[0]):
+                            new_batch_dict[key] = torch.stack(new_tensor_list)
+                        else:
+                            new_batch_dict[key] = new_tensor_list
+        
+        # Create the new batch
         new_batch = DataProto(
-            batch=TensorDict({
-                "responses": padded_responses.to(batch.batch["responses"].device),
-                "prompts": padded_prompts.to(batch.batch["prompts"].device),
-                "input_ids": padded_input_ids.to(batch.batch["input_ids"].device),
-                "attention_mask": torch.stack(padded_attention_masks),
-                "position_ids": torch.stack(padded_position_ids),
-                "response_mask": torch.stack(padded_response_masks),
-            }, batch_size=len(new_responses)),
+            batch=TensorDict(new_batch_dict, batch_size=len(new_responses)),
             non_tensor_batch=new_non_tensor_batch,
-            meta_info=batch.meta_info
+            meta_info=batch.meta_info.copy()
         )
         
-        # Update meta info to indicate PGE was applied
+        # Update meta info
         new_batch.meta_info["pge_applied"] = True
         new_batch.meta_info["num_groups"] = batch_size
-        new_batch.meta_info["samples_per_group"] = 1 + num_perturbations
+        new_batch.meta_info["samples_per_group"] = num_samples_per_group
+        
+        # IMPORTANT: We need to re-evaluate rewards for the perturbed samples
+        # The rewards will be computed later in the training pipeline
+        # Remove old rewards to force re-computation
+        if "token_level_scores" in new_batch.batch:
+            del new_batch.batch["token_level_scores"]
         
         return new_batch
     
