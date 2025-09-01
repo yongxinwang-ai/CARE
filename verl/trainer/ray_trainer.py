@@ -1066,19 +1066,59 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
             for _ in range(actual_samples):
                 new_uids.append(group_uid)
         
+        # Pad all sequences to ensure consistent lengths
+        from ..utils import torch_functional as VF
+        
+        # Get pad token ID
+        pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        
+        # Convert tensors to lists for padding
+        responses_list = [r.squeeze().tolist() if r.dim() > 1 else r.tolist() for r in new_responses]
+        prompts_list = [p.squeeze().tolist() if p.dim() > 1 else p.tolist() for p in new_prompts]
+        input_ids_list = [i.squeeze().tolist() if i.dim() > 1 else i.tolist() for i in new_input_ids]
+        attention_masks_list = [m.squeeze().tolist() if m.dim() > 1 else m.tolist() for m in new_attention_masks]
+        position_ids_list = [p.squeeze().tolist() if p.dim() > 1 else p.tolist() for p in new_position_ids]
+        response_masks_list = [r.squeeze().tolist() if r.dim() > 1 else r.tolist() for r in new_response_masks]
+        
+        # Calculate max length across all tensor types
+        max_response_len = max(len(r) for r in responses_list) if responses_list else 0
+        max_prompt_len = max(len(p) for p in prompts_list) if prompts_list else 0
+        max_input_len = max(len(i) for i in input_ids_list) if input_ids_list else 0
+        max_att_mask_len = max(len(m) for m in attention_masks_list) if attention_masks_list else 0
+        max_pos_ids_len = max(len(p) for p in position_ids_list) if position_ids_list else 0
+        max_resp_mask_len = max(len(r) for r in response_masks_list) if response_masks_list else 0
+        
+        target_seq_len = max(max_response_len, max_prompt_len, max_input_len, 
+                            max_att_mask_len, max_pos_ids_len, max_resp_mask_len)
+        
+        # Pad all sequences using consistent approach
+        padded_responses = VF.pad_2d_list_to_length(responses_list, pad_token_id, max_length=target_seq_len)
+        padded_prompts = VF.pad_2d_list_to_length(prompts_list, pad_token_id, max_length=target_seq_len)
+        padded_input_ids = VF.pad_2d_list_to_length(input_ids_list, pad_token_id, max_length=target_seq_len)
+        padded_attention_masks = VF.pad_2d_list_to_length(attention_masks_list, 0, max_length=target_seq_len)
+        padded_position_ids = VF.pad_2d_list_to_length(position_ids_list, 0, max_length=target_seq_len)
+        padded_response_masks = VF.pad_2d_list_to_length(response_masks_list, 0, max_length=target_seq_len)
+        
+        # Verify all tensors have the same sequence length
+        assert padded_responses.shape[1] == padded_prompts.shape[1], f"Response/prompt length mismatch: {padded_responses.shape[1]} vs {padded_prompts.shape[1]}"
+        assert padded_responses.shape[1] == padded_input_ids.shape[1], f"Response/input_ids length mismatch: {padded_responses.shape[1]} vs {padded_input_ids.shape[1]}"
+        assert padded_responses.shape[1] == padded_attention_masks.shape[1], f"Response/attention_mask length mismatch: {padded_responses.shape[1]} vs {padded_attention_masks.shape[1]}"
+        assert padded_responses.shape[1] == padded_position_ids.shape[1], f"Response/position_ids length mismatch: {padded_responses.shape[1]} vs {padded_position_ids.shape[1]}"
+        assert padded_responses.shape[1] == padded_response_masks.shape[1], f"Response/response_mask length mismatch: {padded_responses.shape[1]} vs {padded_response_masks.shape[1]}"
+        
         # Create new non-tensor batch
         new_non_tensor_batch = batch.non_tensor_batch.copy()
         new_non_tensor_batch["uid"] = np.array(new_uids, dtype=object)
         
-        # Create new batch with contrastive samples
+        # Create new batch with contrastive samples using padded tensors
         new_batch = DataProto(
             batch=TensorDict({
-                "responses": torch.stack(new_responses),
-                "prompts": torch.stack(new_prompts),
-                "input_ids": torch.stack(new_input_ids),
-                "attention_mask": torch.stack(new_attention_masks),
-                "position_ids": torch.stack(new_position_ids),
-                "response_mask": torch.stack(new_response_masks),
+                "responses": padded_responses.to(batch.batch["responses"].device),
+                "prompts": padded_prompts.to(batch.batch["prompts"].device),
+                "input_ids": padded_input_ids.to(batch.batch["input_ids"].device),
+                "attention_mask": padded_attention_masks.to(batch.batch["attention_mask"].device),
+                "position_ids": padded_position_ids.to(batch.batch["position_ids"].device),
+                "response_mask": padded_response_masks.to(batch.batch["response_mask"].device),
                 "cgsg_labels": torch.tensor(cgsg_labels, device=batch.batch["responses"].device),
             }, batch_size=len(new_responses)),
             non_tensor_batch=new_non_tensor_batch,
