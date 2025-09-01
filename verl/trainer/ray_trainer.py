@@ -801,34 +801,13 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
         prompts_list = [p.tolist() if torch.is_tensor(p) else p for p in new_prompts]
         input_ids_list = [i.tolist() if torch.is_tensor(i) else i for i in new_input_ids]
         
-        # Calculate the maximum length needed across all sequences
-        max_response_len = max(len(r) for r in responses_list) if responses_list else 0
-        max_prompt_len = max(len(p) for p in prompts_list) if prompts_list else 0
-        max_input_len = max(len(i) for i in input_ids_list) if input_ids_list else 0
-        
-        # Also check mask lengths to ensure consistency
-        max_mask_len = max(len(m) for m in new_response_masks) if new_response_masks else 0
-        
-        # Use the maximum of all to ensure consistent padding across ALL tensors
-        target_seq_len = max(max_response_len, max_prompt_len, max_input_len, max_mask_len)
-        
-        # Pad all tensors to the same target length
-        padded_responses = VF.pad_2d_list_to_length(responses_list, pad_token_id, max_length=target_seq_len)
-        padded_prompts = VF.pad_2d_list_to_length(prompts_list, pad_token_id, max_length=target_seq_len)
-        padded_input_ids = VF.pad_2d_list_to_length(input_ids_list, pad_token_id, max_length=target_seq_len)
-        
-        # Use the same target length for mask padding
-        padded_seq_len = target_seq_len
-        
-        # Properly pad masks and position IDs
-        padded_attention_masks = []
-        padded_position_ids = []
-        padded_response_masks = []
+        # Convert masks to lists for consistent processing
+        attention_masks_list = []
+        position_ids_list = []
+        response_masks_list = []
         
         for i in range(len(new_input_ids)):
-            orig_len = len(new_input_ids[i])
-            
-            # Get the original masks/position ids and ensure they're 1D
+            # Get the original masks/position ids and ensure they're 1D lists
             orig_att_mask = new_attention_masks[i]
             orig_pos_ids = new_position_ids[i]
             orig_resp_mask = new_response_masks[i]
@@ -840,23 +819,34 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
             if orig_resp_mask.dim() > 1:
                 orig_resp_mask = orig_resp_mask.squeeze()
             
-            # Attention mask: 1 for real tokens, 0 for padding
-            att_mask = torch.zeros(padded_seq_len, dtype=orig_att_mask.dtype, 
-                                  device=orig_att_mask.device)
-            att_mask[:min(orig_len, len(orig_att_mask))] = orig_att_mask[:min(orig_len, len(orig_att_mask))]
-            padded_attention_masks.append(att_mask)
-            
-            # Position IDs: continue sequence for real tokens, 0 for padding
-            pos_ids = torch.zeros(padded_seq_len, dtype=orig_pos_ids.dtype,
-                                device=orig_pos_ids.device)
-            pos_ids[:min(orig_len, len(orig_pos_ids))] = orig_pos_ids[:min(orig_len, len(orig_pos_ids))]
-            padded_position_ids.append(pos_ids)
-            
-            # Response mask: preserve original mask, 0 for padding
-            resp_mask = torch.zeros(padded_seq_len, dtype=orig_resp_mask.dtype,
-                                   device=orig_resp_mask.device)
-            resp_mask[:min(orig_len, len(orig_resp_mask))] = orig_resp_mask[:min(orig_len, len(orig_resp_mask))]
-            padded_response_masks.append(resp_mask)
+            attention_masks_list.append(orig_att_mask.tolist())
+            position_ids_list.append(orig_pos_ids.tolist())
+            response_masks_list.append(orig_resp_mask.tolist())
+        
+        # Calculate the maximum length needed across all sequences
+        max_response_len = max(len(r) for r in responses_list) if responses_list else 0
+        max_prompt_len = max(len(p) for p in prompts_list) if prompts_list else 0
+        max_input_len = max(len(i) for i in input_ids_list) if input_ids_list else 0
+        max_att_mask_len = max(len(m) for m in attention_masks_list) if attention_masks_list else 0
+        max_pos_ids_len = max(len(m) for m in position_ids_list) if position_ids_list else 0
+        max_resp_mask_len = max(len(m) for m in response_masks_list) if response_masks_list else 0
+        
+        # Use the maximum of all to ensure consistent padding across ALL tensors
+        target_seq_len = max(max_response_len, max_prompt_len, max_input_len, 
+                            max_att_mask_len, max_pos_ids_len, max_resp_mask_len)
+        
+        # Pad all tensors using the same padding function and target length
+        padded_responses = VF.pad_2d_list_to_length(responses_list, pad_token_id, max_length=target_seq_len)
+        padded_prompts = VF.pad_2d_list_to_length(prompts_list, pad_token_id, max_length=target_seq_len)
+        padded_input_ids = VF.pad_2d_list_to_length(input_ids_list, pad_token_id, max_length=target_seq_len)
+        
+        # Pad masks using the same approach for consistency
+        # For attention masks: 1 for real tokens, 0 for padding
+        padded_attention_masks = VF.pad_2d_list_to_length(attention_masks_list, 0, max_length=target_seq_len)
+        # For position IDs: use 0 for padding (common practice)
+        padded_position_ids = VF.pad_2d_list_to_length(position_ids_list, 0, max_length=target_seq_len)
+        # For response masks: 0 for padding
+        padded_response_masks = VF.pad_2d_list_to_length(response_masks_list, 0, max_length=target_seq_len)
         
         # Create UIDs for GRPO group processing
         new_uids = []
@@ -882,25 +872,20 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
                         values.append(None)
                 new_non_tensor_batch[key] = np.array(values, dtype=object)
         
-        # Create the new batch - preserve all existing keys
-        # Ensure all tensors have consistent dimensions
-        stacked_attention_masks = torch.stack(padded_attention_masks)
-        stacked_position_ids = torch.stack(padded_position_ids)
-        stacked_response_masks = torch.stack(padded_response_masks)
-        
         # Verify all tensors have the same sequence length (dimension 1)
         assert padded_responses.shape[1] == padded_prompts.shape[1], f"Response/prompt length mismatch: {padded_responses.shape[1]} vs {padded_prompts.shape[1]}"
         assert padded_responses.shape[1] == padded_input_ids.shape[1], f"Response/input_ids length mismatch: {padded_responses.shape[1]} vs {padded_input_ids.shape[1]}"
-        assert padded_responses.shape[1] == stacked_attention_masks.shape[1], f"Response/attention_mask length mismatch: {padded_responses.shape[1]} vs {stacked_attention_masks.shape[1]}"
-        assert padded_responses.shape[1] == stacked_response_masks.shape[1], f"Response/response_mask length mismatch: {padded_responses.shape[1]} vs {stacked_response_masks.shape[1]}"
+        assert padded_responses.shape[1] == padded_attention_masks.shape[1], f"Response/attention_mask length mismatch: {padded_responses.shape[1]} vs {padded_attention_masks.shape[1]}"
+        assert padded_responses.shape[1] == padded_position_ids.shape[1], f"Response/position_ids length mismatch: {padded_responses.shape[1]} vs {padded_position_ids.shape[1]}"
+        assert padded_responses.shape[1] == padded_response_masks.shape[1], f"Response/response_mask length mismatch: {padded_responses.shape[1]} vs {padded_response_masks.shape[1]}"
         
         new_batch_dict = {
             "responses": padded_responses.to(batch.batch["responses"].device),
             "prompts": padded_prompts.to(batch.batch["prompts"].device),
             "input_ids": padded_input_ids.to(batch.batch["input_ids"].device),
-            "attention_mask": stacked_attention_masks,
-            "position_ids": stacked_position_ids,
-            "response_mask": stacked_response_masks,
+            "attention_mask": padded_attention_masks.to(batch.batch["attention_mask"].device),
+            "position_ids": padded_position_ids.to(batch.batch["position_ids"].device),
+            "response_mask": padded_response_masks.to(batch.batch["response_mask"].device),
         }
         
         # Copy any additional keys from the original batch that we haven't explicitly handled
