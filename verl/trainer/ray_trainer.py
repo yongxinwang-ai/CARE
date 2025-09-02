@@ -741,12 +741,15 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
                             perturbed_response, model=None, tokenizer=self.tokenizer
                         )
                 
-                # Ensure the perturbed response maintains at least the original length
+                # Ensure the perturbed response maintains EXACTLY the original length
                 # This prevents tensor size mismatches during training
                 if len(perturbed_response) < original_response_length:
                     # Pad with EOS or PAD tokens to maintain length
                     pad_token = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else pad_token_id
                     perturbed_response.extend([pad_token] * (original_response_length - len(perturbed_response)))
+                elif len(perturbed_response) > original_response_length:
+                    # Truncate to maintain exact length
+                    perturbed_response = perturbed_response[:original_response_length]
                 
                 # Convert back to tensor
                 perturbed_response_tensor = torch.tensor(perturbed_response, dtype=golden_response_from_input.dtype, 
