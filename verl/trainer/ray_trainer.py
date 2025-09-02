@@ -133,78 +133,63 @@ def compute_cgsg_contrastive_advantage(
     token_level_rewards: torch.Tensor,
     response_mask: torch.Tensor,
     cgsg_labels: torch.Tensor,
-    num_groups: int,
-    samples_per_group: int,
-    eps: float = 1e-6
+    samples_per_group_list: List[int],
+    eps: float = 1e-6,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compute contrastive advantages for CGSG.
-    
+    """Compute contrastive advantages for CGSG with ragged groups.
+
+    Uses a cross-entropy style signal per group: adv = (y - softmax(scores)),
+    where y is 1 for golden, 0 for negatives. Normalizes advantages per group
+    for stability, then broadcasts to token level via response_mask.
+
     Args:
-        token_level_rewards: Token-level rewards (batch_size, seq_len)
-        response_mask: Response mask (batch_size, seq_len)
-        cgsg_labels: Labels indicating golden (1) or negative (0) samples
-        num_groups: Number of prompt groups
-        samples_per_group: Number of samples per group (1 golden + N negatives)
-        eps: Small value for numerical stability
-        
+        token_level_rewards: (N, T) token-level rewards
+        response_mask: (N, T) response mask
+        cgsg_labels: (N,) labels, 1.0 for golden, 0.0 for negatives
+        samples_per_group_list: list of sample counts per group (ragged supported)
+        eps: numerical stability epsilon
+
     Returns:
-        advantages: Contrastive advantages
-        returns: Returns (same as advantages for outcome-based rewards)
+        advantages, returns: token-level tensors shaped (N, T)
     """
-    # Sum token rewards to get response-level rewards
-    scores = token_level_rewards.sum(dim=-1)
-    
-    # Reshape to group structure
-    scores = scores.view(num_groups, samples_per_group)
-    labels = cgsg_labels.view(num_groups, samples_per_group)
-    
-    # Compute contrastive advantages
-    advantages = torch.zeros_like(scores)
-    
-    for i in range(num_groups):
-        group_scores = scores[i]
-        group_labels = labels[i]
-        
-        # Find golden sample (label = 1)
-        golden_mask = group_labels == 1
-        golden_idx = golden_mask.nonzero(as_tuple=True)[0]
-        
-        if len(golden_idx) == 0:
-            continue  # Skip if no golden sample
-            
-        # Find negative samples (label = 0)
-        negative_mask = group_labels == 0
-        negative_idx = negative_mask.nonzero(as_tuple=True)[0]
-        
-        if len(negative_idx) == 0:
-            # Only golden sample, give it advantage of 1
-            advantages[i, golden_idx[0]] = 1.0
+    # Response-level scores
+    scores = token_level_rewards.sum(dim=-1)  # (N,)
+
+    advantages_flat = torch.zeros_like(scores)
+    offset = 0
+    for gsz in samples_per_group_list:
+        if gsz <= 0:
             continue
-        
-        # Compute stable softmax using log-sum-exp trick for numerical stability
+        s, e = offset, offset + gsz
+        group_scores = scores[s:e]
+        group_labels = cgsg_labels[s:e]
+
+        # Softmax over group for probabilities
         max_score = group_scores.max()
-        exp_scores = torch.exp(group_scores - max_score)
-        
-        # Compute log probabilities (which serve as initial advantages)
-        log_probs = torch.log(exp_scores / (exp_scores.sum() + eps))
-        
-        # Use normalized advantages for more stable training
-        # This helps prevent extreme gradients
-        mean_log_prob = log_probs.mean()
-        std_log_prob = log_probs.std() + eps
-        normalized_advantages = (log_probs - mean_log_prob) / std_log_prob
-        
-        # Assign normalized advantages
-        for j in range(len(group_scores)):
-            advantages[i, j] = normalized_advantages[j].item()
-    
-    # Flatten back to batch dimension
-    advantages = advantages.view(-1)
-    
-    # Expand to token level
-    returns = advantages.unsqueeze(-1) * response_mask
+        probs = torch.exp(group_scores - max_score)
+        probs = probs / (probs.sum() + eps)
+
+        # One-hot style targets from labels (allow multiple goldens)
+        y = (group_labels > 0).float()
+        if y.sum() == 0:
+            # Fallback to top-1 if no golden provided
+            y = torch.zeros_like(group_scores)
+            y[group_scores.argmax()] = 1.0
+
+        # Cross-entropy gradient proxy: y - p
+        adv = y - probs
+
+        # Normalize per group to stabilize scale
+        mean = adv.mean()
+        std = adv.std() + eps
+        adv = (adv - mean) / std
+
+        advantages_flat[s:e] = adv
+        offset = e
+
+    # Broadcast to token level
+    returns = advantages_flat.unsqueeze(-1) * response_mask
     advantages = returns
-    
     return advantages, returns
 
 
@@ -223,10 +208,15 @@ def compute_advantage(data: DataProto, adv_estimator: AdvantageEstimator, gamma:
             # The structure of the batch (golden + negatives) will naturally create contrast
             advantages, returns = core_algos.compute_grpo_outcome_advantage(token_level_rewards, response_mask, index)
         elif loss_type == "contrastive_loss":
-            # Implement contrastive loss-based advantages
+            # Implement contrastive loss-based advantages (ragged-safe)
+            spg_list = data.meta_info.get("samples_per_group_list")
+            if spg_list is None:
+                # Fallback to uniform grouping if older meta is present
+                num_groups = int(data.meta_info["num_groups"])  # type: ignore[index]
+                samples_per_group = int(data.meta_info["samples_per_group"])  # type: ignore[index]
+                spg_list = [samples_per_group for _ in range(num_groups)]
             advantages, returns = compute_cgsg_contrastive_advantage(
-                token_level_rewards, response_mask, cgsg_labels, 
-                data.meta_info["num_groups"], data.meta_info["samples_per_group"]
+                token_level_rewards, response_mask, cgsg_labels, spg_list
             )
         else:
             raise ValueError(f"Unknown CGSG loss type: {loss_type}")
@@ -571,7 +561,7 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
         """
         import uuid
         import numpy as np
-        from ..utils.perturbations import substitute_tokens, delete_tokens, insert_tokens
+        from ..utils.perturbations import substitute_tokens, delete_tokens, insert_tokens, resample_reasoning_step
         from ..utils import torch_functional as VF
         from tensordict import TensorDict
         
@@ -744,6 +734,11 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
                         neutral_tokens = [self.tokenizer.pad_token_id] if self.tokenizer.pad_token_id else []
                         perturbed_response = insert_tokens(
                             perturbed_response, perturbation_strength, neutral_tokens
+                        )
+                    elif method == "cot_step_resample":
+                        # Alias to a CoT step resampling stub
+                        perturbed_response = resample_reasoning_step(
+                            perturbed_response, model=None, tokenizer=self.tokenizer
                         )
                 
                 # Ensure the perturbed response maintains at least the original length
@@ -966,6 +961,7 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
         new_position_ids = []
         new_response_masks = []
         cgsg_labels = []  # 1 for golden, 0 for negatives
+        selected_indices: List[int] = []  # Track indices into the original batch
         
         num_negatives = cgsg_config["num_negatives"]
         negative_selection = cgsg_config["negative_selection_strategy"]
@@ -998,6 +994,7 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
                 new_position_ids.append(batch.batch["position_ids"][golden_idx])
                 new_response_masks.append(batch.batch["response_mask"][golden_idx])
                 cgsg_labels.append(1.0)  # Golden sample label
+                selected_indices.append(golden_idx)
             
             # Select negative samples (only from samples with reward < threshold)
             if negative_selection == "lowest_reward":
@@ -1027,6 +1024,7 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
                 new_position_ids.append(batch.batch["position_ids"][neg_idx])
                 new_response_masks.append(batch.batch["response_mask"][neg_idx])
                 cgsg_labels.append(0.0)  # Negative sample label
+                selected_indices.append(neg_idx)
         
         # Create UIDs for new batch
         new_uids = []
@@ -1106,8 +1104,15 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
         assert padded_responses.shape[1] == padded_position_ids.shape[1], f"Response/position_ids length mismatch: {padded_responses.shape[1]} vs {padded_position_ids.shape[1]}"
         assert padded_responses.shape[1] == padded_response_masks.shape[1], f"Response/response_mask length mismatch: {padded_responses.shape[1]} vs {padded_response_masks.shape[1]}"
         
-        # Create new non-tensor batch
-        new_non_tensor_batch = batch.non_tensor_batch.copy()
+        # Create new non-tensor batch by selecting the same sample order
+        new_non_tensor_batch = {}
+        for key, value in batch.non_tensor_batch.items():
+            try:
+                new_non_tensor_batch[key] = value[selected_indices]
+            except Exception:
+                # If selection is not applicable, skip and rebuild where needed (e.g., uid below)
+                continue
+        # Override uid with freshly constructed group ids
         new_non_tensor_batch["uid"] = np.array(new_uids, dtype=object)
         
         # Create new batch with contrastive samples using padded tensors
