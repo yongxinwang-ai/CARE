@@ -790,7 +790,7 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
                 # Copy golden sample's non-tensor data for perturbed sample
                 original_non_tensor_batch.append(golden_non_tensor.copy())
         
-        # Pad all sequences to the same length
+        # Pad all sequences; use separate targets for sequence-level tensors vs response-only tensors
         # Convert tensors to lists for padding
         responses_list = [r.tolist() if torch.is_tensor(r) else r for r in new_responses]
         prompts_list = [p.tolist() if torch.is_tensor(p) else p for p in new_prompts]
@@ -819,19 +819,21 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
             response_masks_list.append(orig_resp_mask.tolist())
         
         # Calculate the maximum length needed across all sequences
+        # Response length is independent from full sequence length
         max_response_len = max(len(r) for r in responses_list) if responses_list else 0
         max_prompt_len = max(len(p) for p in prompts_list) if prompts_list else 0
         max_input_len = max(len(i) for i in input_ids_list) if input_ids_list else 0
         max_att_mask_len = max(len(m) for m in attention_masks_list) if attention_masks_list else 0
         max_pos_ids_len = max(len(m) for m in position_ids_list) if position_ids_list else 0
         max_resp_mask_len = max(len(m) for m in response_masks_list) if response_masks_list else 0
-        
-        # Use the maximum of all to ensure consistent padding across ALL tensors
-        target_seq_len = max(max_response_len, max_prompt_len, max_input_len, 
-                            max_att_mask_len, max_pos_ids_len, max_resp_mask_len)
+
+        # target length for sequence-level tensors
+        target_seq_len = max(max_prompt_len, max_input_len, max_att_mask_len, max_pos_ids_len)
+        # target length for response-only tensors
+        target_resp_len = max_response_len
         
         # Pad all tensors using the same padding function and target length
-        padded_responses = VF.pad_2d_list_to_length(responses_list, pad_token_id, max_length=target_seq_len)
+        padded_responses = VF.pad_2d_list_to_length(responses_list, pad_token_id, max_length=target_resp_len)
         padded_prompts = VF.pad_2d_list_to_length(prompts_list, pad_token_id, max_length=target_seq_len)
         padded_input_ids = VF.pad_2d_list_to_length(input_ids_list, pad_token_id, max_length=target_seq_len)
         
@@ -840,8 +842,17 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
         padded_attention_masks = VF.pad_2d_list_to_length(attention_masks_list, 0, max_length=target_seq_len)
         # For position IDs: use 0 for padding (common practice)
         padded_position_ids = VF.pad_2d_list_to_length(position_ids_list, 0, max_length=target_seq_len)
-        # For response masks: 0 for padding
-        padded_response_masks = VF.pad_2d_list_to_length(response_masks_list, 0, max_length=target_seq_len)
+        # For response masks: derive from responses (respect EOS), 0 for padding, length matches responses
+        resp_masks_resp_only = []
+        eos_id = getattr(self.tokenizer, "eos_token_id", None)
+        for resp_ids in responses_list:
+            if len(resp_ids) == 0:
+                resp_masks_resp_only.append([])
+            else:
+                resp_tensor = torch.tensor(resp_ids, dtype=torch.long)
+                resp_mask = VF.get_response_mask(resp_tensor.unsqueeze(0), eos_token_id=eos_id, dtype=torch.long)
+                resp_masks_resp_only.append(resp_mask.squeeze(0).tolist())
+        padded_response_masks = VF.pad_2d_list_to_length(resp_masks_resp_only, 0, max_length=target_resp_len)
         
         # Create UIDs for GRPO group processing
         new_uids = []
@@ -867,12 +878,13 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
                         values.append(None)
                 new_non_tensor_batch[key] = np.array(values, dtype=object)
         
-        # Verify all tensors have the same sequence length (dimension 1)
-        assert padded_responses.shape[1] == padded_prompts.shape[1], f"Response/prompt length mismatch: {padded_responses.shape[1]} vs {padded_prompts.shape[1]}"
-        assert padded_responses.shape[1] == padded_input_ids.shape[1], f"Response/input_ids length mismatch: {padded_responses.shape[1]} vs {padded_input_ids.shape[1]}"
-        assert padded_responses.shape[1] == padded_attention_masks.shape[1], f"Response/attention_mask length mismatch: {padded_responses.shape[1]} vs {padded_attention_masks.shape[1]}"
-        assert padded_responses.shape[1] == padded_position_ids.shape[1], f"Response/position_ids length mismatch: {padded_responses.shape[1]} vs {padded_position_ids.shape[1]}"
-        assert padded_responses.shape[1] == padded_response_masks.shape[1], f"Response/response_mask length mismatch: {padded_responses.shape[1]} vs {padded_response_masks.shape[1]}"
+        # Verify sequence-level tensors share length and response-level tensors share length
+        assert padded_prompts.shape[1] == padded_input_ids.shape[1] == padded_attention_masks.shape[1] == padded_position_ids.shape[1], (
+            f"Seq tensors length mismatch: prompts={padded_prompts.shape[1]}, input_ids={padded_input_ids.shape[1]}, attn={padded_attention_masks.shape[1]}, pos={padded_position_ids.shape[1]}"
+        )
+        assert padded_responses.shape[1] == padded_response_masks.shape[1], (
+            f"Responses/mask length mismatch: responses={padded_responses.shape[1]} vs mask={padded_response_masks.shape[1]}"
+        )
         
         new_batch_dict = {
             "responses": padded_responses.to(batch.batch["responses"].device),
@@ -1085,24 +1097,31 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
         max_att_mask_len = max(len(m) for m in attention_masks_list) if attention_masks_list else 0
         max_pos_ids_len = max(len(p) for p in position_ids_list) if position_ids_list else 0
         max_resp_mask_len = max(len(r) for r in response_masks_list) if response_masks_list else 0
-        
-        target_seq_len = max(max_response_len, max_prompt_len, max_input_len, 
-                            max_att_mask_len, max_pos_ids_len, max_resp_mask_len)
-        
+
+        # Separate targets for sequence-level and response-level tensors
+        target_seq_len = max(max_prompt_len, max_input_len, max_att_mask_len, max_pos_ids_len)
+        target_resp_len = max_response_len
+
         # Pad all sequences using consistent approach
-        padded_responses = VF.pad_2d_list_to_length(responses_list, pad_token_id, max_length=target_seq_len)
+        padded_responses = VF.pad_2d_list_to_length(responses_list, pad_token_id, max_length=target_resp_len)
         padded_prompts = VF.pad_2d_list_to_length(prompts_list, pad_token_id, max_length=target_seq_len)
         padded_input_ids = VF.pad_2d_list_to_length(input_ids_list, pad_token_id, max_length=target_seq_len)
         padded_attention_masks = VF.pad_2d_list_to_length(attention_masks_list, 0, max_length=target_seq_len)
         padded_position_ids = VF.pad_2d_list_to_length(position_ids_list, 0, max_length=target_seq_len)
-        padded_response_masks = VF.pad_2d_list_to_length(response_masks_list, 0, max_length=target_seq_len)
-        
-        # Verify all tensors have the same sequence length
-        assert padded_responses.shape[1] == padded_prompts.shape[1], f"Response/prompt length mismatch: {padded_responses.shape[1]} vs {padded_prompts.shape[1]}"
-        assert padded_responses.shape[1] == padded_input_ids.shape[1], f"Response/input_ids length mismatch: {padded_responses.shape[1]} vs {padded_input_ids.shape[1]}"
-        assert padded_responses.shape[1] == padded_attention_masks.shape[1], f"Response/attention_mask length mismatch: {padded_responses.shape[1]} vs {padded_attention_masks.shape[1]}"
-        assert padded_responses.shape[1] == padded_position_ids.shape[1], f"Response/position_ids length mismatch: {padded_responses.shape[1]} vs {padded_position_ids.shape[1]}"
-        assert padded_responses.shape[1] == padded_response_masks.shape[1], f"Response/response_mask length mismatch: {padded_responses.shape[1]} vs {padded_response_masks.shape[1]}"
+        # Convert sequence-length response masks into response-length masks by taking tail matching response length
+        resp_masks_resp_only = []
+        for i, rm in enumerate(response_masks_list):
+            resp_len_i = len(responses_list[i])
+            resp_masks_resp_only.append(rm[-resp_len_i:] if resp_len_i > 0 else [])
+        padded_response_masks = VF.pad_2d_list_to_length(resp_masks_resp_only, 0, max_length=target_resp_len)
+
+        # Verify sequence-level tensors share length and response-level tensors share length
+        assert padded_prompts.shape[1] == padded_input_ids.shape[1] == padded_attention_masks.shape[1] == padded_position_ids.shape[1], (
+            f"Seq tensors length mismatch: prompts={padded_prompts.shape[1]}, input_ids={padded_input_ids.shape[1]}, attn={padded_attention_masks.shape[1]}, pos={padded_position_ids.shape[1]}"
+        )
+        assert padded_responses.shape[1] == padded_response_masks.shape[1], (
+            f"Responses/mask length mismatch: responses={padded_responses.shape[1]} vs mask={padded_response_masks.shape[1]}"
+        )
         
         # Create new non-tensor batch by selecting the same sample order
         new_non_tensor_batch = {}

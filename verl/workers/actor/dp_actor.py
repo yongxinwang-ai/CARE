@@ -240,7 +240,13 @@ class DataParallelPPOActor(BasePPOActor):
 
             for mini_batch in mini_batches:
                 response_length = mini_batch.batch["responses"].size(-1)
-                response_mask = mini_batch.batch["attention_mask"][:, -response_length:]
+                # Prefer explicit response_mask if provided; otherwise fall back to slicing attention_mask
+                if "response_mask" in mini_batch.batch.keys():
+                    response_mask = mini_batch.batch["response_mask"]
+                    if response_mask.size(-1) != response_length:
+                        response_mask = response_mask[:, -response_length:]
+                else:
+                    response_mask = mini_batch.batch["attention_mask"][:, -response_length:]
                 total_response_tokens = torch.sum(response_mask)
                 dist.all_reduce(torch.sum(response_mask), op=dist.ReduceOp.SUM)
 
@@ -257,7 +263,13 @@ class DataParallelPPOActor(BasePPOActor):
                 for micro_batch in micro_batches:
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
                     response_length = model_inputs["responses"].size(-1)
-                    response_mask = model_inputs["attention_mask"][:, -response_length:]
+                    # Prefer explicit response_mask if provided; otherwise fall back to slicing attention_mask
+                    if "response_mask" in model_inputs:
+                        response_mask = model_inputs["response_mask"]
+                        if response_mask.size(-1) != response_length:
+                            response_mask = response_mask[:, -response_length:]
+                    else:
+                        response_mask = model_inputs["attention_mask"][:, -response_length:]
                     old_log_probs = model_inputs["old_log_probs"]
                     advantages = model_inputs["advantages"]
 
