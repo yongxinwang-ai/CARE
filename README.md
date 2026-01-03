@@ -1,6 +1,6 @@
 # CARE: Contrastive Anchored-REflection for Verifiable Multimodal Reasoning
 
-&nbsp&nbsp📑 <a href="https://arxiv.org/pdf/2512.19554">Paper</a>&nbsp&nbsp | &nbsp&nbsp🤗 <a href="https://huggingface.co/YongxinWang">Hugging Face</a>&nbsp&nbsp 
+📑 <a href="https://arxiv.org/pdf/2512.19554">Paper</a> | 🤗 <a href="https://huggingface.co/YongxinWang">Hugging Face</a>
 
 
 ## News
