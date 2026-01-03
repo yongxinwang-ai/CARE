@@ -183,7 +183,8 @@ tensorboard_log/
 images/
 images*
 
-tests/
+tests/*
+
 visual/
 
 AGENTS.md
@@ -191,3 +192,4 @@ CLAUDE.md
 *.log
 
 ROADMAP.md
+
