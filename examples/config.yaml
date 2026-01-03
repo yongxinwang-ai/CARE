@@ -32,7 +32,7 @@ algorithm:
   filter_high: 0.99
   
   # GRPO variant configuration
-  grpo_variant: standard  # Options: "standard", "pge", "cgsg"
+  grpo_variant: standard  # Options: "standard", "pge", "cgsg", "care"
   
   # PGE (Perturbed Golden Ensemble) configuration
   pge_config:
@@ -45,6 +45,34 @@ algorithm:
     num_negatives: 4  # Number of hard negatives to select
     negative_selection_strategy: "lowest_reward"  # Options: "lowest_reward", "max_diversity"
     loss_type: "normalized_advantage"  # Options: "normalized_advantage", "contrastive_loss"
+
+# CARE configuration
+care:
+  K: 4
+  M: 6
+  neg_scale_s: 0.5
+  eps: 1.0e-6
+  equalize: true
+  rescue:
+    enable: true
+    delta: 0.1
+  token_weighting: region_weighted
+  gamma_pos: 0.005
+  instrument:
+    enable: false
+    care_jsonl: null
+    rgr_jsonl: null
+
+# RGR (Reflection-Guided Resampling) configuration
+rgr:
+  enable: true
+  template: structured
+  max_critique_tokens: 64
+  s_refl: null
+  sampling:
+    temperature: 0.6
+    top_p: 0.95
+    max_tokens: 512
 
 worker:
   actor:
@@ -74,7 +102,7 @@ worker:
       offload_optimizer: true  # true: more CPU memory; false: more GPU memory
 
   rollout:
-    n: 5
+    n: 8
     temperature: 1.0
     top_p: 1.0
     limit_images: 0
@@ -117,3 +145,28 @@ trainer:
   save_model_only: false
   save_checkpoint_path: null
   load_checkpoint_path: null
+
+# Reflex (1P1N-Reflex) configuration
+reflex:
+  enable: false  # Enable 1P1N-Reflex hook (disable by default)
+  m: 1  # Number of resamples per negative sample
+  use_pos_as_hint: false  # Use positive sample as hint in critique
+  from_negative: true  # Generate from negative sample (true) vs from scratch (false)
+  template: default  # Reflection template: "default", "free", "structured"
+  hint_mode: final_answer  # How to extract hint from positive sample
+  max_critique_tokens: 64  # Max tokens for critique generation
+
+  # Sampling parameters for reflex generation
+  sampling:
+    temperature: 0.6
+    top_p: 0.95
+    max_tokens: 512
+
+  # Instrumentation (event logging)
+  instrument:
+    enable: false  # Enable event logging (disable by default)
+    log_jsonl: null  # Path to JSONL log file (set via command line)
+    add_canary: false  # Add canary tokens to detect hint leakage
+    canary_token: "<HINT_CANARY>"  # Canary token string
+    log_problem_text: false  # Include full problem text in events
+    log_negative_answer: false  # Include negative answer text in events

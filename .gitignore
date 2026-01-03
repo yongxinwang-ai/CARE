@@ -182,3 +182,12 @@ tensorboard_log/
 # data
 images/
 images*
+
+tests/
+visual/
+
+AGENTS.md
+CLAUDE.md
+*.log
+
+ROADMAP.md

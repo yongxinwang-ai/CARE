@@ -17,10 +17,11 @@ Implement Actor
 
 import os
 from collections import defaultdict
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from einops import rearrange
 from ray.experimental.tqdm_ray import tqdm
 from torch import nn
@@ -159,6 +160,95 @@ class DataParallelPPOActor(BasePPOActor):
 
         return log_probs
 
+    def _forward_micro_batch_embeddings(self, micro_batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        input_ids = micro_batch["input_ids"]
+        batch_size, seqlen = input_ids.shape
+        attention_mask = micro_batch["attention_mask"]
+        position_ids = micro_batch["position_ids"]
+        responses = micro_batch["responses"]
+        response_mask = micro_batch["response_mask"]
+        think_span_mask = micro_batch["think_span_mask"]
+        response_length = responses.size(-1)
+
+        if position_ids.dim() == 3:  # qwen2vl mrope
+            position_ids = position_ids.transpose(0, 1)  # (bsz, 3, seqlen) -> (3, bsz, seqlen)
+
+        multi_modal_inputs = defaultdict(list)
+        if "multi_modal_inputs" in micro_batch:
+            for input_dict in micro_batch["multi_modal_inputs"]:
+                for key, value in input_dict.items():
+                    multi_modal_inputs[key].append(value)
+
+            for key, value in multi_modal_inputs.items():
+                if len(value) != 0:
+                    multi_modal_inputs[key] = torch.cat(value, dim=0)
+                else:
+                    multi_modal_inputs[key] = None
+
+        if self.config.padding_free:
+            input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask)
+            input_ids_rmpad = input_ids_rmpad.transpose(0, 1)
+
+            if position_ids.dim() == 3:
+                position_ids_rmpad = (
+                    index_first_axis(rearrange(position_ids, "c b s ... -> (b s) c ..."), indices)
+                    .transpose(0, 1)
+                    .unsqueeze(1)
+                )
+            else:
+                position_ids_rmpad = index_first_axis(
+                    rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices
+                ).transpose(0, 1)
+
+            if self.config.ulysses_size > 1:
+                input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad_and_slice_inputs(
+                    input_ids_rmpad, position_ids_rmpad, sp_size=self.config.ulysses_size
+                )
+
+            output = self.actor_module(
+                input_ids=input_ids_rmpad,
+                attention_mask=None,
+                position_ids=position_ids_rmpad,
+                **multi_modal_inputs,
+                use_cache=False,
+                output_hidden_states=True,
+            )
+
+            hidden_rmpad = getattr(output, "last_hidden_state", None)
+            if hidden_rmpad is None:
+                hidden_rmpad = output.hidden_states[-1]
+            hidden_rmpad = hidden_rmpad.squeeze(0)
+
+            if self.config.ulysses_size > 1:
+                hidden_rmpad = gather_outputs_and_unpad(
+                    hidden_rmpad, gather_dim=0, unpad_dim=0, padding_size=pad_size
+                )
+
+            hidden = pad_input(hidden_states=hidden_rmpad, indices=indices, batch=batch_size, seqlen=seqlen)
+        else:
+            output = self.actor_module(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                **multi_modal_inputs,
+                use_cache=False,
+                output_hidden_states=True,
+            )
+            hidden = getattr(output, "last_hidden_state", None)
+            if hidden is None:
+                hidden = output.hidden_states[-1]
+
+        response_hidden = hidden[:, -response_length:, :]
+        span_mask = think_span_mask
+        if span_mask.size(-1) != response_length:
+            span_mask = span_mask[:, -response_length:]
+        if response_mask.size(-1) != response_length:
+            response_mask = response_mask[:, -response_length:]
+        span_mask = span_mask.float() * response_mask.float()
+        denom = span_mask.sum(dim=1).clamp(min=1).unsqueeze(-1)
+        pooled = (response_hidden * span_mask.unsqueeze(-1)).sum(dim=1) / denom
+        return F.normalize(pooled, dim=-1)
+
     def _optimizer_step(self) -> torch.Tensor:
         if isinstance(self.actor_module, FSDP):
             grad_norm = self.actor_module.clip_grad_norm_(self.config.max_grad_norm)
@@ -220,6 +310,34 @@ class DataParallelPPOActor(BasePPOActor):
             log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
 
         return log_probs
+
+    @torch.no_grad()
+    def compute_think_embeddings(self, data: DataProto) -> torch.Tensor:
+        self.actor_module.eval()
+
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "response_mask", "think_span_mask"]
+        non_tensor_select_keys = ["multi_modal_inputs"]
+
+        data = data.select(select_keys, non_tensor_select_keys)
+        if self.config.dynamic_batching:
+            max_token_len = self.config.micro_batch_size_per_device_for_experience * data.batch["input_ids"].size(-1)
+            micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
+        else:
+            micro_batches = data.split(self.config.micro_batch_size_per_device_for_experience)
+
+        embeddings: List[torch.Tensor] = []
+        if self.rank == 0:
+            micro_batches = tqdm(micro_batches, desc="Compute think embeddings", position=1)
+
+        for micro_batch in micro_batches:
+            model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+            pooled = self._forward_micro_batch_embeddings(model_inputs)
+            embeddings.append(pooled)
+
+        embeddings_tensor = torch.cat(embeddings, dim=0)
+        if self.config.dynamic_batching:
+            embeddings_tensor = restore_dynamic_batch(embeddings_tensor, batch_idx_list)
+        return embeddings_tensor
 
     def update_policy(self, data: DataProto) -> Dict[str, Any]:
         self.actor_module.train()

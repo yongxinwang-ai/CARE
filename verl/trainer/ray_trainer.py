@@ -23,17 +23,20 @@ from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Any, Dict, List, Optional, Type
 
 import numpy as np
 import ray
 import torch
 from ray.experimental.tqdm_ray import tqdm
-from tensordict import TensorDict
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PreTrainedTokenizer, ProcessorMixin
 
 from ..protocol import DataProto, pad_dataproto_to_divisor, unpad_dataproto
+from ..algorithms.adv_estimators.care import build_care_group_infos, compute_care_advantages
+from ..algorithms.losses import apply_region_weighted_advantages
+from ..hooks.rgr import apply_rgr_care, process_rgr_events
+from ..utils.response_tags import extract_region_masks
 from ..single_controller.base import Worker
 from ..single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
 from ..single_controller.ray.base import create_colocated_worker_cls
@@ -129,98 +132,11 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: KLController, kl_penalty="kl"):
     return data, metrics
 
 
-def compute_cgsg_contrastive_advantage(
-    token_level_rewards: torch.Tensor,
-    response_mask: torch.Tensor,
-    cgsg_labels: torch.Tensor,
-    samples_per_group_list: List[int],
-    eps: float = 1e-6,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compute contrastive advantages for CGSG with ragged groups.
-
-    Uses a cross-entropy style signal per group: adv = (y - softmax(scores)),
-    where y is 1 for golden, 0 for negatives. Normalizes advantages per group
-    for stability, then broadcasts to token level via response_mask.
-
-    Args:
-        token_level_rewards: (N, T) token-level rewards
-        response_mask: (N, T) response mask
-        cgsg_labels: (N,) labels, 1.0 for golden, 0.0 for negatives
-        samples_per_group_list: list of sample counts per group (ragged supported)
-        eps: numerical stability epsilon
-
-    Returns:
-        advantages, returns: token-level tensors shaped (N, T)
-    """
-    # Response-level scores
-    scores = token_level_rewards.sum(dim=-1)  # (N,)
-
-    advantages_flat = torch.zeros_like(scores)
-    offset = 0
-    for gsz in samples_per_group_list:
-        if gsz <= 0:
-            continue
-        s, e = offset, offset + gsz
-        group_scores = scores[s:e]
-        group_labels = cgsg_labels[s:e]
-
-        # Softmax over group for probabilities
-        max_score = group_scores.max()
-        probs = torch.exp(group_scores - max_score)
-        probs = probs / (probs.sum() + eps)
-
-        # One-hot style targets from labels (allow multiple goldens)
-        y = (group_labels > 0).float()
-        if y.sum() == 0:
-            # Fallback to top-1 if no golden provided
-            y = torch.zeros_like(group_scores)
-            y[group_scores.argmax()] = 1.0
-
-        # Cross-entropy gradient proxy: y - p
-        adv = y - probs
-
-        # Normalize per group to stabilize scale
-        mean = adv.mean()
-        std = adv.std() + eps
-        adv = (adv - mean) / std
-
-        advantages_flat[s:e] = adv
-        offset = e
-
-    # Broadcast to token level
-    returns = advantages_flat.unsqueeze(-1) * response_mask
-    advantages = returns
-    return advantages, returns
-
-
 def compute_advantage(data: DataProto, adv_estimator: AdvantageEstimator, gamma: float = 1.0, lam: float = 1.0):
     token_level_rewards = data.batch["token_level_rewards"]
     response_mask = data.batch["response_mask"]
     index = data.non_tensor_batch["uid"]
-    
-    # Check if CGSG is applied
-    if data.meta_info.get("cgsg_applied", False):
-        loss_type = data.meta_info.get("loss_type", "normalized_advantage")
-        cgsg_labels = data.batch["cgsg_labels"]
-        
-        if loss_type == "normalized_advantage":
-            # Use standard GRPO advantage computation
-            # The structure of the batch (golden + negatives) will naturally create contrast
-            advantages, returns = core_algos.compute_grpo_outcome_advantage(token_level_rewards, response_mask, index)
-        elif loss_type == "contrastive_loss":
-            # Implement contrastive loss-based advantages (ragged-safe)
-            spg_list = data.meta_info.get("samples_per_group_list")
-            if spg_list is None:
-                # Fallback to uniform grouping if older meta is present
-                num_groups = int(data.meta_info["num_groups"])  # type: ignore[index]
-                samples_per_group = int(data.meta_info["samples_per_group"])  # type: ignore[index]
-                spg_list = [samples_per_group for _ in range(num_groups)]
-            advantages, returns = compute_cgsg_contrastive_advantage(
-                token_level_rewards, response_mask, cgsg_labels, spg_list
-            )
-        else:
-            raise ValueError(f"Unknown CGSG loss type: {loss_type}")
-    elif adv_estimator == AdvantageEstimator.GAE:
+    if adv_estimator == AdvantageEstimator.GAE:
         values = data.batch["values"]
         advantages, returns = core_algos.compute_gae_advantage_return(
             token_level_rewards, values, response_mask, gamma, lam
@@ -550,617 +466,6 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
             seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix
         )
         metrics.update(global_balance_stats)
-    
-    def _apply_pge_variant(self, batch: DataProto) -> DataProto:
-        """Apply Perturbed Golden Ensemble (PGE) variant processing.
-        
-        1. Select golden samples (highest reward per prompt)
-        2. Generate perturbations of golden samples
-        3. Construct new batch with golden + perturbations
-        4. Re-evaluate rewards for the new batch
-        """
-        import uuid
-        import numpy as np
-        from ..utils.perturbations import substitute_tokens, delete_tokens, insert_tokens, resample_reasoning_step
-        from ..utils import torch_functional as VF
-        from tensordict import TensorDict
-        
-        pge_config = self.config.algorithm.pge_config
-        n_rollouts = self.config.worker.rollout.n
-        
-        # Get pad token ID early as it's needed throughout
-        pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-        
-        # Get rewards if not already computed
-        if "token_level_scores" not in batch.batch:
-            reward_tensor, _ = ray.get(self.reward_fn.compute_reward.remote(batch))
-            batch.batch["token_level_scores"] = reward_tensor
-        
-        # Sum token rewards to get response-level rewards
-        response_rewards = batch.batch["token_level_scores"].sum(dim=-1)
-        
-        # Process each prompt group
-        total_samples = len(batch.batch["responses"])
-        batch_size = total_samples // n_rollouts
-        
-        new_responses = []
-        new_prompts = []
-        new_input_ids = []
-        new_attention_masks = []
-        new_position_ids = []
-        new_response_masks = []
-        
-        # Store original data we need to preserve
-        original_non_tensor_batch = []
-        
-        vocab_size = self.tokenizer.vocab_size
-        special_token_ids = [self.tokenizer.pad_token_id, self.tokenizer.eos_token_id, 
-                            self.tokenizer.bos_token_id] if self.tokenizer else []
-        
-        # Add image token ID for vision-language models like Qwen2-VL
-        if hasattr(self.tokenizer, 'convert_tokens_to_ids'):
-            try:
-                image_token_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
-                if image_token_id is not None:
-                    special_token_ids.append(image_token_id)
-            except:
-                pass  # Not a VL model or doesn't have image tokens
-        
-        special_token_ids = [t for t in special_token_ids if t is not None]
-        
-        for i in range(batch_size):
-            # Get rewards for this prompt's rollouts
-            start_idx = i * n_rollouts
-            end_idx = (i + 1) * n_rollouts
-            prompt_rewards = response_rewards[start_idx:end_idx]
-            
-            # Select golden sample (highest reward)
-            golden_idx_local = torch.argmax(prompt_rewards).item()
-            golden_idx = start_idx + golden_idx_local
-            
-            # Extract golden sample data
-            golden_response = batch.batch["responses"][golden_idx]
-            golden_prompt = batch.batch["prompts"][golden_idx]
-            golden_input_ids = batch.batch["input_ids"][golden_idx]
-            golden_attention_mask = batch.batch["attention_mask"][golden_idx]
-            golden_position_ids = batch.batch["position_ids"][golden_idx]
-            golden_response_mask = batch.batch["response_mask"][golden_idx]
-            
-            # Ensure tensors are 1D (remove padding dimension if present)
-            if golden_response.dim() > 1:
-                golden_response = golden_response.squeeze(0)
-            if golden_prompt.dim() > 1:
-                golden_prompt = golden_prompt.squeeze(0)
-            if golden_input_ids.dim() > 1:
-                golden_input_ids = golden_input_ids.squeeze(0)
-            if golden_attention_mask.dim() > 1:
-                golden_attention_mask = golden_attention_mask.squeeze(0)
-            if golden_position_ids.dim() > 1:
-                golden_position_ids = golden_position_ids.squeeze(0)
-            if golden_response_mask.dim() > 1:
-                golden_response_mask = golden_response_mask.squeeze(0)
-            
-            # Find actual lengths (non-padded) and where response starts in input_ids
-            # For input_ids, we need to preserve the exact structure including image tokens
-            # For vision-language models, we need to be careful not to treat image tokens as padding
-            input_ids_nonpad = len(golden_input_ids)  # Start with full length
-            # Find the last non-pad token from the end
-            for idx in range(len(golden_input_ids) - 1, -1, -1):
-                if golden_input_ids[idx] != pad_token_id:
-                    input_ids_nonpad = idx + 1
-                    break
-            response_mask_nonpad = golden_response_mask[:input_ids_nonpad] if input_ids_nonpad > 0 else golden_response_mask
-            
-            # Find where the response starts in the input_ids (first position where response_mask is 1)
-            if (response_mask_nonpad == 1).any():
-                response_start_idx = (response_mask_nonpad == 1).nonzero(as_tuple=True)[0][0].item()
-            else:
-                # If no response mask, assume everything after prompt is response
-                # This is a fallback - in practice, response_mask should always have 1s
-                response_start_idx = len(golden_prompt) if len(golden_prompt) < input_ids_nonpad else input_ids_nonpad // 2
-            
-            # Extract the actual prompt and response from input_ids
-            golden_prompt_from_input = golden_input_ids[:response_start_idx] if response_start_idx > 0 else golden_input_ids[:1]
-            golden_response_from_input = golden_input_ids[response_start_idx:input_ids_nonpad] if response_start_idx < input_ids_nonpad else golden_input_ids[-1:]
-            
-            # Store original non-tensor data for golden sample
-            golden_non_tensor = {}
-            for key in batch.non_tensor_batch.keys():
-                if key in batch.non_tensor_batch and len(batch.non_tensor_batch[key]) > golden_idx:
-                    golden_non_tensor[key] = batch.non_tensor_batch[key][golden_idx]
-            
-            # Add golden sample to new batch (use the properly extracted versions)
-            golden_input_ids_nonpad = golden_input_ids[:input_ids_nonpad]
-            
-            # Count image tokens in the original to ensure preservation
-            if hasattr(self.tokenizer, 'convert_tokens_to_ids'):
-                try:
-                    image_token_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
-                    original_image_count = (golden_input_ids_nonpad == image_token_id).sum().item()
-                    
-                    # Debug: Check if we're losing image tokens
-                    if original_image_count == 0 and "pixel_values" in batch.batch:
-                        # If we have pixel values but no image tokens, something is wrong
-                        # Use the original full input_ids without truncation
-                        golden_input_ids_nonpad = golden_input_ids
-                        golden_prompt_from_input = golden_input_ids[:response_start_idx] if response_start_idx > 0 else golden_input_ids
-                        golden_response_from_input = golden_input_ids[response_start_idx:] if response_start_idx > 0 else torch.tensor([], device=golden_input_ids.device)
-                        original_image_count = (golden_input_ids == image_token_id).sum().item()
-                except:
-                    original_image_count = 0
-            else:
-                original_image_count = 0
-            
-            # For compatibility with existing code, also extract prompt and response separately
-            # But preserve the original structure
-            new_responses.append(golden_response_from_input)
-            new_prompts.append(golden_prompt_from_input)
-            new_input_ids.append(golden_input_ids_nonpad)
-            
-            # Create fresh masks for the non-padded sequence
-            nonpad_len = len(golden_input_ids_nonpad)
-            new_attention_masks.append(torch.ones(nonpad_len, dtype=golden_attention_mask.dtype, device=golden_attention_mask.device))
-            new_position_ids.append(torch.arange(nonpad_len, dtype=golden_position_ids.dtype, device=golden_position_ids.device))
-            resp_mask = torch.zeros(nonpad_len, dtype=golden_response_mask.dtype, device=golden_response_mask.device)
-            resp_mask[response_start_idx:] = 1
-            new_response_masks.append(resp_mask)
-            
-            original_non_tensor_batch.append(golden_non_tensor)
-            
-            # Generate perturbations
-            num_perturbations = pge_config["num_perturbations"]
-            perturbation_methods = pge_config["perturbation_methods"]
-            perturbation_strength = pge_config["perturbation_strength"]
-            
-            # Use the response extracted from input_ids to preserve structure
-            response_only = golden_response_from_input.clone()
-            
-            for _ in range(num_perturbations):
-                # Apply perturbations only to the response part
-                perturbed_response = response_only.cpu().tolist() if torch.is_tensor(response_only) else response_only.tolist()
-                original_response_length = len(perturbed_response)
-                
-                for method in perturbation_methods:
-                    if method == "token_substitute":
-                        perturbed_response = substitute_tokens(
-                            perturbed_response, perturbation_strength, vocab_size, special_token_ids
-                        )
-                    elif method == "token_delete":
-                        perturbed_response = delete_tokens(
-                            perturbed_response, perturbation_strength, special_token_ids, min_length=5
-                        )
-                    elif method == "token_insert":
-                        # For insert, we can use padding token as neutral
-                        neutral_tokens = [self.tokenizer.pad_token_id] if self.tokenizer.pad_token_id else []
-                        perturbed_response = insert_tokens(
-                            perturbed_response, perturbation_strength, neutral_tokens
-                        )
-                    elif method == "cot_step_resample":
-                        # Alias to a CoT step resampling stub
-                        perturbed_response = resample_reasoning_step(
-                            perturbed_response, model=None, tokenizer=self.tokenizer
-                        )
-                
-                # Ensure the perturbed response maintains EXACTLY the original length
-                # This prevents tensor size mismatches during training
-                if len(perturbed_response) < original_response_length:
-                    # Pad with EOS or PAD tokens to maintain length
-                    pad_token = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else pad_token_id
-                    perturbed_response.extend([pad_token] * (original_response_length - len(perturbed_response)))
-                elif len(perturbed_response) > original_response_length:
-                    # Truncate to maintain exact length
-                    perturbed_response = perturbed_response[:original_response_length]
-                
-                # Convert back to tensor
-                perturbed_response_tensor = torch.tensor(perturbed_response, dtype=golden_response_from_input.dtype, 
-                                                        device=golden_response_from_input.device)
-                
-                # Reconstruct full sequence (preserve the exact prompt structure with image tokens)
-                perturbed_input_ids = torch.cat([golden_prompt_from_input, perturbed_response_tensor])
-                
-                # Verify image tokens are preserved in perturbed sequence
-                if hasattr(self.tokenizer, 'convert_tokens_to_ids'):
-                    try:
-                        image_token_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
-                        perturbed_image_count = (perturbed_input_ids == image_token_id).sum().item()
-                        # If we lost image tokens, use the original golden input_ids instead
-                        if original_image_count > 0 and perturbed_image_count != original_image_count:
-                            # Fall back to using the original golden sample
-                            perturbed_input_ids = golden_input_ids_nonpad.clone()
-                    except:
-                        pass
-                
-                # Create proper masks for the perturbed sequence
-                seq_len = len(perturbed_input_ids)
-                perturbed_attention_mask = torch.ones(seq_len, dtype=golden_attention_mask.dtype, 
-                                                     device=golden_attention_mask.device)
-                perturbed_position_ids = torch.arange(seq_len, dtype=golden_position_ids.dtype,
-                                                     device=golden_position_ids.device)
-                
-                # Response mask: 0 for prompt, 1 for response
-                perturbed_response_mask = torch.zeros(seq_len, dtype=golden_response_mask.dtype,
-                                                     device=golden_response_mask.device)
-                perturbed_response_mask[len(golden_prompt_from_input):] = 1
-                
-                # Add to new batch
-                new_responses.append(perturbed_response_tensor)
-                new_prompts.append(golden_prompt_from_input)
-                new_input_ids.append(perturbed_input_ids)
-                new_attention_masks.append(perturbed_attention_mask)
-                new_position_ids.append(perturbed_position_ids)
-                new_response_masks.append(perturbed_response_mask)
-                
-                # Copy golden sample's non-tensor data for perturbed sample
-                original_non_tensor_batch.append(golden_non_tensor.copy())
-        
-        # Pad all sequences; use separate targets for sequence-level tensors vs response-only tensors
-        # Convert tensors to lists for padding
-        responses_list = [r.tolist() if torch.is_tensor(r) else r for r in new_responses]
-        prompts_list = [p.tolist() if torch.is_tensor(p) else p for p in new_prompts]
-        input_ids_list = [i.tolist() if torch.is_tensor(i) else i for i in new_input_ids]
-        
-        # Convert masks to lists for consistent processing
-        attention_masks_list = []
-        position_ids_list = []
-        response_masks_list = []
-        
-        for i in range(len(new_input_ids)):
-            # Get the original masks/position ids and ensure they're 1D lists
-            orig_att_mask = new_attention_masks[i]
-            orig_pos_ids = new_position_ids[i]
-            orig_resp_mask = new_response_masks[i]
-            
-            if orig_att_mask.dim() > 1:
-                orig_att_mask = orig_att_mask.squeeze()
-            if orig_pos_ids.dim() > 1:
-                orig_pos_ids = orig_pos_ids.squeeze()
-            if orig_resp_mask.dim() > 1:
-                orig_resp_mask = orig_resp_mask.squeeze()
-            
-            attention_masks_list.append(orig_att_mask.tolist())
-            position_ids_list.append(orig_pos_ids.tolist())
-            response_masks_list.append(orig_resp_mask.tolist())
-        
-        # Calculate the maximum length needed across all sequences
-        # Response length is independent from full sequence length
-        max_response_len = max(len(r) for r in responses_list) if responses_list else 0
-        max_prompt_len = max(len(p) for p in prompts_list) if prompts_list else 0
-        max_input_len = max(len(i) for i in input_ids_list) if input_ids_list else 0
-        max_att_mask_len = max(len(m) for m in attention_masks_list) if attention_masks_list else 0
-        max_pos_ids_len = max(len(m) for m in position_ids_list) if position_ids_list else 0
-        max_resp_mask_len = max(len(m) for m in response_masks_list) if response_masks_list else 0
-
-        # target length for sequence-level tensors
-        target_seq_len = max(max_prompt_len, max_input_len, max_att_mask_len, max_pos_ids_len)
-        # target length for response-only tensors
-        target_resp_len = max_response_len
-        
-        # Pad all tensors using the same padding function and target length
-        padded_responses = VF.pad_2d_list_to_length(responses_list, pad_token_id, max_length=target_resp_len)
-        padded_prompts = VF.pad_2d_list_to_length(prompts_list, pad_token_id, max_length=target_seq_len)
-        padded_input_ids = VF.pad_2d_list_to_length(input_ids_list, pad_token_id, max_length=target_seq_len)
-        
-        # Pad masks using the same approach for consistency
-        # For attention masks: 1 for real tokens, 0 for padding
-        padded_attention_masks = VF.pad_2d_list_to_length(attention_masks_list, 0, max_length=target_seq_len)
-        # For position IDs: use 0 for padding (common practice)
-        padded_position_ids = VF.pad_2d_list_to_length(position_ids_list, 0, max_length=target_seq_len)
-        # For response masks: derive from responses (respect EOS), 0 for padding, length matches responses
-        resp_masks_resp_only = []
-        eos_id = getattr(self.tokenizer, "eos_token_id", None)
-        for resp_ids in responses_list:
-            if len(resp_ids) == 0:
-                resp_masks_resp_only.append([])
-            else:
-                resp_tensor = torch.tensor(resp_ids, dtype=torch.long)
-                resp_mask = VF.get_response_mask(resp_tensor.unsqueeze(0), eos_token_id=eos_id, dtype=torch.long)
-                resp_masks_resp_only.append(resp_mask.squeeze(0).tolist())
-        padded_response_masks = VF.pad_2d_list_to_length(resp_masks_resp_only, 0, max_length=target_resp_len)
-        
-        # Create UIDs for GRPO group processing
-        new_uids = []
-        num_samples_per_group = 1 + num_perturbations
-        for i in range(batch_size):
-            group_uid = str(uuid.uuid4())
-            for _ in range(num_samples_per_group):
-                new_uids.append(group_uid)
-        
-        # Prepare non-tensor batch
-        new_non_tensor_batch = {}
-        for key in batch.non_tensor_batch.keys():
-            if key == "uid":
-                new_non_tensor_batch[key] = np.array(new_uids, dtype=object)
-            else:
-                # Collect values from original_non_tensor_batch
-                values = []
-                for item in original_non_tensor_batch:
-                    if key in item:
-                        values.append(item[key])
-                    else:
-                        # Use default/placeholder value
-                        values.append(None)
-                new_non_tensor_batch[key] = np.array(values, dtype=object)
-        
-        # Verify sequence-level tensors share length and response-level tensors share length
-        assert padded_prompts.shape[1] == padded_input_ids.shape[1] == padded_attention_masks.shape[1] == padded_position_ids.shape[1], (
-            f"Seq tensors length mismatch: prompts={padded_prompts.shape[1]}, input_ids={padded_input_ids.shape[1]}, attn={padded_attention_masks.shape[1]}, pos={padded_position_ids.shape[1]}"
-        )
-        assert padded_responses.shape[1] == padded_response_masks.shape[1], (
-            f"Responses/mask length mismatch: responses={padded_responses.shape[1]} vs mask={padded_response_masks.shape[1]}"
-        )
-        
-        new_batch_dict = {
-            "responses": padded_responses.to(batch.batch["responses"].device),
-            "prompts": padded_prompts.to(batch.batch["prompts"].device),
-            "input_ids": padded_input_ids.to(batch.batch["input_ids"].device),
-            "attention_mask": padded_attention_masks.to(batch.batch["attention_mask"].device),
-            "position_ids": padded_position_ids.to(batch.batch["position_ids"].device),
-            "response_mask": padded_response_masks.to(batch.batch["response_mask"].device),
-        }
-        
-        # Copy any additional keys from the original batch that we haven't explicitly handled
-        # This preserves image-related tensors for VL models
-        for key in batch.batch.keys():
-            if key not in new_batch_dict and key != "token_level_scores":
-                # For image/video related tensors, we need to duplicate them for each sample in the group
-                original_tensor = batch.batch[key]
-                if original_tensor is not None:
-                    new_tensor_list = []
-                    for i in range(batch_size):
-                        # Get the golden sample's tensor
-                        start_idx = i * n_rollouts
-                        golden_idx_local = torch.argmax(response_rewards[start_idx:start_idx + n_rollouts]).item()
-                        golden_idx = start_idx + golden_idx_local
-                        golden_tensor = original_tensor[golden_idx] if len(original_tensor) > golden_idx else None
-                        
-                        if golden_tensor is not None:
-                            # Add golden sample's tensor
-                            new_tensor_list.append(golden_tensor)
-                            # Duplicate for each perturbation
-                            for _ in range(num_perturbations):
-                                new_tensor_list.append(golden_tensor.clone() if torch.is_tensor(golden_tensor) else golden_tensor)
-                    
-                    if new_tensor_list:
-                        # Stack or concatenate based on the tensor type
-                        if torch.is_tensor(new_tensor_list[0]):
-                            new_batch_dict[key] = torch.stack(new_tensor_list)
-                        else:
-                            new_batch_dict[key] = new_tensor_list
-        
-        # Create the new batch
-        new_batch = DataProto(
-            batch=TensorDict(new_batch_dict, batch_size=len(new_responses)),
-            non_tensor_batch=new_non_tensor_batch,
-            meta_info=batch.meta_info.copy()
-        )
-        
-        # Update meta info
-        new_batch.meta_info["pge_applied"] = True
-        new_batch.meta_info["num_groups"] = batch_size
-        new_batch.meta_info["samples_per_group"] = num_samples_per_group
-        
-        # IMPORTANT: We need to re-evaluate rewards for the perturbed samples
-        # The rewards will be computed later in the training pipeline
-        # Remove old rewards to force re-computation
-        if "token_level_scores" in new_batch.batch:
-            del new_batch.batch["token_level_scores"]
-        
-        return new_batch
-    
-    def _apply_cgsg_variant(self, batch: DataProto) -> DataProto:
-        """Apply Contrastive Golden Sample Group (CGSG) variant processing.
-        
-        1. Select golden samples (all samples with reward=1, or highest reward if none)
-        2. Select hard negatives (samples with reward<1)
-        3. Construct new batch with golden + negatives
-        """
-        cgsg_config = self.config.algorithm.cgsg_config
-        n_rollouts = self.config.worker.rollout.n
-        
-        # Get rewards if not already computed
-        if "token_level_scores" not in batch.batch:
-            reward_tensor, _ = ray.get(self.reward_fn.compute_reward.remote(batch))
-            batch.batch["token_level_scores"] = reward_tensor
-        
-        # Sum token rewards to get response-level rewards
-        response_rewards = batch.batch["token_level_scores"].sum(dim=-1)
-        
-        # Process each prompt group
-        total_samples = len(batch.batch["responses"])
-        batch_size = total_samples // n_rollouts
-        
-        new_responses = []
-        new_prompts = []
-        new_input_ids = []
-        new_attention_masks = []
-        new_position_ids = []
-        new_response_masks = []
-        cgsg_labels = []  # 1 for golden, 0 for negatives
-        selected_indices: List[int] = []  # Track indices into the original batch
-        
-        num_negatives = cgsg_config["num_negatives"]
-        negative_selection = cgsg_config["negative_selection_strategy"]
-        
-        for i in range(batch_size):
-            # Get rewards for this prompt's rollouts
-            start_idx = i * n_rollouts
-            end_idx = (i + 1) * n_rollouts
-            prompt_rewards = response_rewards[start_idx:end_idx]
-            
-            # Identify golden samples: all with reward >= threshold, or highest if none
-            reward_threshold = cgsg_config.get("reward_threshold", 0.99)  # Consider rewards >= threshold as correct
-            golden_mask = prompt_rewards >= reward_threshold
-            
-            if golden_mask.any():
-                # Use all samples with reward >= threshold as golden samples
-                golden_indices_local = torch.where(golden_mask)[0].tolist()
-            else:
-                # No perfect samples, use the single highest reward as golden
-                golden_idx_local = torch.argmax(prompt_rewards).item()
-                golden_indices_local = [golden_idx_local]
-            
-            # Add all golden samples
-            for golden_idx_local in golden_indices_local:
-                golden_idx = start_idx + golden_idx_local
-                new_responses.append(batch.batch["responses"][golden_idx])
-                new_prompts.append(batch.batch["prompts"][golden_idx])
-                new_input_ids.append(batch.batch["input_ids"][golden_idx])
-                new_attention_masks.append(batch.batch["attention_mask"][golden_idx])
-                new_position_ids.append(batch.batch["position_ids"][golden_idx])
-                new_response_masks.append(batch.batch["response_mask"][golden_idx])
-                cgsg_labels.append(1.0)  # Golden sample label
-                selected_indices.append(golden_idx)
-            
-            # Select negative samples (only from samples with reward < threshold)
-            if negative_selection == "lowest_reward":
-                # Get indices of non-golden samples
-                all_indices = list(range(len(prompt_rewards)))
-                non_golden_indices = [idx for idx in all_indices if idx not in golden_indices_local]
-                
-                # Only select from samples with reward < threshold as negatives
-                negative_candidates = []
-                for idx in non_golden_indices:
-                    if prompt_rewards[idx] < reward_threshold:
-                        negative_candidates.append((idx, prompt_rewards[idx].item()))
-                
-                # Sort by reward and select lowest ones
-                negative_candidates.sort(key=lambda x: x[1])
-                negative_indices_local = [idx for idx, _ in negative_candidates[:num_negatives]]
-            else:
-                raise ValueError(f"Unknown negative selection strategy: {negative_selection}")
-            
-            # Add negative samples
-            for neg_idx_local in negative_indices_local:
-                neg_idx = start_idx + neg_idx_local
-                new_responses.append(batch.batch["responses"][neg_idx])
-                new_prompts.append(batch.batch["prompts"][neg_idx])
-                new_input_ids.append(batch.batch["input_ids"][neg_idx])
-                new_attention_masks.append(batch.batch["attention_mask"][neg_idx])
-                new_position_ids.append(batch.batch["position_ids"][neg_idx])
-                new_response_masks.append(batch.batch["response_mask"][neg_idx])
-                cgsg_labels.append(0.0)  # Negative sample label
-                selected_indices.append(neg_idx)
-        
-        # Create UIDs for new batch
-        new_uids = []
-        samples_per_group_list = []  # Track actual samples per group
-        
-        # Correctly track samples per group based on actual batch construction
-        for i in range(batch_size):
-            # Get rewards for this prompt's rollouts
-            start_idx = i * n_rollouts
-            end_idx = (i + 1) * n_rollouts
-            prompt_rewards = response_rewards[start_idx:end_idx]
-            
-            # Count golden samples
-            reward_threshold = cgsg_config.get("reward_threshold", 0.99)
-            golden_mask = prompt_rewards >= reward_threshold
-            
-            if golden_mask.any():
-                num_golden = golden_mask.sum().item()
-            else:
-                num_golden = 1  # Single highest reward sample
-            
-            # Count negative samples that were actually added
-            if negative_selection == "lowest_reward":
-                # Count samples with reward < threshold
-                negative_mask = prompt_rewards < reward_threshold
-                num_negative_candidates = negative_mask.sum().item()
-                # Actual negatives is min of candidates and requested num_negatives
-                num_actual_negatives = min(num_negative_candidates, num_negatives)
-            else:
-                num_actual_negatives = 0
-            
-            actual_samples = num_golden + num_actual_negatives
-            samples_per_group_list.append(actual_samples)
-            
-            # Each group gets same UID for GRPO advantage computation
-            group_uid = str(uuid.uuid4())
-            for _ in range(actual_samples):
-                new_uids.append(group_uid)
-        
-        # Pad all sequences to ensure consistent lengths
-        from ..utils import torch_functional as VF
-        
-        # Get pad token ID
-        pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-        
-        # Convert tensors to lists for padding
-        responses_list = [r.squeeze().tolist() if r.dim() > 1 else r.tolist() for r in new_responses]
-        prompts_list = [p.squeeze().tolist() if p.dim() > 1 else p.tolist() for p in new_prompts]
-        input_ids_list = [i.squeeze().tolist() if i.dim() > 1 else i.tolist() for i in new_input_ids]
-        attention_masks_list = [m.squeeze().tolist() if m.dim() > 1 else m.tolist() for m in new_attention_masks]
-        position_ids_list = [p.squeeze().tolist() if p.dim() > 1 else p.tolist() for p in new_position_ids]
-        response_masks_list = [r.squeeze().tolist() if r.dim() > 1 else r.tolist() for r in new_response_masks]
-        
-        # Calculate max length across all tensor types
-        max_response_len = max(len(r) for r in responses_list) if responses_list else 0
-        max_prompt_len = max(len(p) for p in prompts_list) if prompts_list else 0
-        max_input_len = max(len(i) for i in input_ids_list) if input_ids_list else 0
-        max_att_mask_len = max(len(m) for m in attention_masks_list) if attention_masks_list else 0
-        max_pos_ids_len = max(len(p) for p in position_ids_list) if position_ids_list else 0
-        max_resp_mask_len = max(len(r) for r in response_masks_list) if response_masks_list else 0
-
-        # Separate targets for sequence-level and response-level tensors
-        target_seq_len = max(max_prompt_len, max_input_len, max_att_mask_len, max_pos_ids_len)
-        target_resp_len = max_response_len
-
-        # Pad all sequences using consistent approach
-        padded_responses = VF.pad_2d_list_to_length(responses_list, pad_token_id, max_length=target_resp_len)
-        padded_prompts = VF.pad_2d_list_to_length(prompts_list, pad_token_id, max_length=target_seq_len)
-        padded_input_ids = VF.pad_2d_list_to_length(input_ids_list, pad_token_id, max_length=target_seq_len)
-        padded_attention_masks = VF.pad_2d_list_to_length(attention_masks_list, 0, max_length=target_seq_len)
-        padded_position_ids = VF.pad_2d_list_to_length(position_ids_list, 0, max_length=target_seq_len)
-        # Convert sequence-length response masks into response-length masks by taking tail matching response length
-        resp_masks_resp_only = []
-        for i, rm in enumerate(response_masks_list):
-            resp_len_i = len(responses_list[i])
-            resp_masks_resp_only.append(rm[-resp_len_i:] if resp_len_i > 0 else [])
-        padded_response_masks = VF.pad_2d_list_to_length(resp_masks_resp_only, 0, max_length=target_resp_len)
-
-        # Verify sequence-level tensors share length and response-level tensors share length
-        assert padded_prompts.shape[1] == padded_input_ids.shape[1] == padded_attention_masks.shape[1] == padded_position_ids.shape[1], (
-            f"Seq tensors length mismatch: prompts={padded_prompts.shape[1]}, input_ids={padded_input_ids.shape[1]}, attn={padded_attention_masks.shape[1]}, pos={padded_position_ids.shape[1]}"
-        )
-        assert padded_responses.shape[1] == padded_response_masks.shape[1], (
-            f"Responses/mask length mismatch: responses={padded_responses.shape[1]} vs mask={padded_response_masks.shape[1]}"
-        )
-        
-        # Create new non-tensor batch by selecting the same sample order
-        new_non_tensor_batch = {}
-        for key, value in batch.non_tensor_batch.items():
-            try:
-                new_non_tensor_batch[key] = value[selected_indices]
-            except Exception:
-                # If selection is not applicable, skip and rebuild where needed (e.g., uid below)
-                continue
-        # Override uid with freshly constructed group ids
-        new_non_tensor_batch["uid"] = np.array(new_uids, dtype=object)
-        
-        # Create new batch with contrastive samples using padded tensors
-        new_batch = DataProto(
-            batch=TensorDict({
-                "responses": padded_responses.to(batch.batch["responses"].device),
-                "prompts": padded_prompts.to(batch.batch["prompts"].device),
-                "input_ids": padded_input_ids.to(batch.batch["input_ids"].device),
-                "attention_mask": padded_attention_masks.to(batch.batch["attention_mask"].device),
-                "position_ids": padded_position_ids.to(batch.batch["position_ids"].device),
-                "response_mask": padded_response_masks.to(batch.batch["response_mask"].device),
-                "cgsg_labels": torch.tensor(cgsg_labels, device=batch.batch["responses"].device),
-            }, batch_size=len(new_responses)),
-            non_tensor_batch=new_non_tensor_batch,
-            meta_info=batch.meta_info
-        )
-        
-        # Update meta info
-        new_batch.meta_info["cgsg_applied"] = True
-        new_batch.meta_info["loss_type"] = cgsg_config["loss_type"]
-        new_batch.meta_info["num_groups"] = batch_size
-        # Use the most common samples_per_group for reshaping (should be consistent)
-        new_batch.meta_info["samples_per_group"] = max(set(samples_per_group_list), key=samples_per_group_list.count)
-        new_batch.meta_info["samples_per_group_list"] = samples_per_group_list
-        
-        return new_batch
 
     def _make_batch_data(self, metrics: Dict[str, Any]) -> DataProto:
         batch = None
@@ -1241,7 +546,7 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
             if current_batch_size < rollout_batch_size:
                 max_try_make_batch = self.config.trainer.max_try_make_batch
                 if max_try_make_batch <= 0 or num_try_make_batch < max_try_make_batch:
-                    continue  # Continue generating more batches
+                    print(f"{num_try_make_batch=}. Continue generating...")
                 else:
                     raise ValueError(
                         f"{num_try_make_batch=} >= {max_try_make_batch=}. Generated too many. Please check your data."
@@ -1250,15 +555,184 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
                 if self.config.algorithm.online_filtering:
                     metrics.update({f"reward/{k}": v for k, v in reduce_metrics(all_metrics).items()})
 
-                batch = batch[: self.config.data.rollout_batch_size * self.config.worker.rollout.n]
-                
-                # Apply PGE or CGSG variant processing if configured
-                if self.config.algorithm.grpo_variant == "pge":
-                    batch = self._apply_pge_variant(batch)
-                elif self.config.algorithm.grpo_variant == "cgsg":
-                    batch = self._apply_cgsg_variant(batch)
-                    
-                return batch
+                return batch[: self.config.data.rollout_batch_size * self.config.worker.rollout.n]
+
+    def _log_care_events(self, events: List[Dict[str, float]], step: int) -> None:
+        if not events:
+            return
+        if not self.config.care.instrument or not self.config.care.instrument.enable:
+            return
+        log_path = self.config.care.instrument.care_jsonl
+        if not log_path:
+            return
+        log_dir = os.path.dirname(log_path)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as f:
+            for event in events:
+                payload = dict(event)
+                payload["step"] = step
+                f.write(json.dumps(payload) + "\n")
+
+    def _apply_care_variant(self, batch: DataProto, step: int) -> DataProto:
+        if "token_level_scores" not in batch.batch:
+            return batch
+
+        care_cfg = self.config.care
+        rgr_cfg = self.config.rgr
+        if rgr_cfg.s_refl is None:
+            rgr_cfg.s_refl = care_cfg.neg_scale_s / 2.0
+
+        uids = batch.non_tensor_batch.get("uid")
+        if uids is None:
+            return batch
+        uids = uids.tolist() if isinstance(uids, np.ndarray) else list(uids)
+
+        response_mask = batch.batch["response_mask"]
+        rewards = batch.batch["token_level_scores"].sum(dim=-1)
+
+        think_mask, answer_mask, think_len, answer_len = extract_region_masks(
+            batch.batch["responses"], response_mask, self.tokenizer
+        )
+        resp_len = response_mask.sum(dim=-1)
+        think_len = torch.where(think_len > 0, think_len, resp_len)
+        answer_len = torch.where(answer_len > 0, answer_len, resp_len)
+
+        missing_think = think_mask.sum(dim=-1) == 0
+        if torch.any(missing_think):
+            think_mask = torch.where(missing_think.unsqueeze(-1), response_mask.bool(), think_mask)
+
+        embed_dp = batch.select(
+            batch_keys=["input_ids", "attention_mask", "position_ids", "responses", "response_mask"],
+            non_tensor_batch_keys=["multi_modal_data"],
+        )
+        embed_dp.batch["think_span_mask"] = think_mask
+        embeddings_dp = self.actor_rollout_ref_wg.compute_think_embeddings(embed_dp)
+        embeddings = embeddings_dp.batch["think_embeddings"]
+
+        group_infos = build_care_group_infos(
+            uids,
+            rewards,
+            think_len,
+            answer_len,
+            embeddings,
+            k=care_cfg.K,
+            m=care_cfg.M,
+        )
+
+        rgr_events: List[Dict[str, Any]] = []
+        if rgr_cfg.enable:
+            try:
+                self.actor_rollout_ref_wg.prepare_rollout_engine()
+                appended, rgr_events, replacements = apply_rgr_care(
+                    batch=batch,
+                    tokenizer=self.tokenizer,
+                    llm_generate_fn=self.actor_rollout_ref_wg.generate_sequences,
+                    sampling_params=rgr_cfg.sampling,
+                    cfg=rgr_cfg,
+                    group_infos=group_infos,
+                )
+            finally:
+                try:
+                    self.actor_rollout_ref_wg.release_rollout_engine()
+                except Exception:
+                    pass
+            if appended is not None and len(appended) > 0:
+                reward_tensor_new, _ = ray.get(self.reward_fn.compute_reward.remote(appended))
+                appended.batch["token_level_scores"] = reward_tensor_new
+
+                old_lp_new = self.actor_rollout_ref_wg.compute_log_probs(appended)
+                appended = appended.union(old_lp_new)
+                if self.use_reference_policy:
+                    ref_lp_new = self.actor_rollout_ref_wg.compute_ref_log_probs(appended)
+                    appended = appended.union(ref_lp_new)
+
+                think_mask_new, answer_mask_new, think_len_new, answer_len_new = extract_region_masks(
+                    appended.batch["responses"], appended.batch["response_mask"], self.tokenizer
+                )
+                resp_len_new = appended.batch["response_mask"].sum(dim=-1)
+                think_len_new = torch.where(think_len_new > 0, think_len_new, resp_len_new)
+                answer_len_new = torch.where(answer_len_new > 0, answer_len_new, resp_len_new)
+                missing_think_new = think_mask_new.sum(dim=-1) == 0
+                if torch.any(missing_think_new):
+                    think_mask_new = torch.where(
+                        missing_think_new.unsqueeze(-1), appended.batch["response_mask"].bool(), think_mask_new
+                    )
+
+                embed_dp_new = appended.select(
+                    batch_keys=["input_ids", "attention_mask", "position_ids", "responses", "response_mask"],
+                    non_tensor_batch_keys=["multi_modal_data"],
+                )
+                embed_dp_new.batch["think_span_mask"] = think_mask_new
+                embeddings_new = self.actor_rollout_ref_wg.compute_think_embeddings(embed_dp_new).batch[
+                    "think_embeddings"
+                ]
+
+                orig_len = len(batch)
+                rewards_new = reward_tensor_new.sum(dim=-1)
+                rewards = torch.cat([rewards, rewards_new], dim=0)
+                embeddings = torch.cat([embeddings, embeddings_new], dim=0)
+                think_mask = torch.cat([think_mask, think_mask_new], dim=0)
+                answer_mask = torch.cat([answer_mask, answer_mask_new], dim=0)
+                think_len = torch.cat([think_len, think_len_new], dim=0)
+                answer_len = torch.cat([answer_len, answer_len_new], dim=0)
+
+                batch = DataProto.concat([batch, appended])
+
+                for group_id, neg_idx, append_local_idx in replacements:
+                    new_idx = orig_len + append_local_idx
+                    for info in group_infos:
+                        if info.group_id != group_id:
+                            continue
+                        if neg_idx in info.neg_indices:
+                            neg_pos = info.neg_indices.index(neg_idx)
+                            info.neg_indices[neg_pos] = new_idx
+                        info.reflected_idx = new_idx
+                        info.reflected_failed = bool(rewards[new_idx].item() <= 0)
+
+                if self.config.care.instrument and self.config.care.instrument.enable:
+                    process_rgr_events(
+                        events=rgr_events,
+                        appended=appended,
+                        tokenizer=self.tokenizer,
+                        rewards=rewards_new,
+                        cfg=rgr_cfg,
+                        log_path=self.config.care.instrument.rgr_jsonl,
+                    )
+
+        seq_adv, care_events = compute_care_advantages(
+            group_infos=group_infos,
+            rewards=rewards,
+            old_log_probs=batch.batch["old_log_probs"],
+            response_mask=batch.batch["response_mask"],
+            embeddings=embeddings,
+            k=care_cfg.K,
+            neg_scale_s=care_cfg.neg_scale_s,
+            eps=care_cfg.eps,
+            equalize=care_cfg.equalize,
+            rescue_enable=care_cfg.rescue.enable,
+            rescue_delta=care_cfg.rescue.delta,
+            s_refl=rgr_cfg.s_refl,
+        )
+
+        if care_cfg.token_weighting == "region_weighted":
+            token_adv = apply_region_weighted_advantages(
+                sequence_advantages=seq_adv,
+                response_mask=batch.batch["response_mask"],
+                think_mask=think_mask,
+                answer_mask=answer_mask,
+                rewards=rewards,
+                gamma_pos=care_cfg.gamma_pos,
+                eps=care_cfg.eps,
+            )
+        else:
+            token_adv = seq_adv.unsqueeze(-1) * batch.batch["response_mask"]
+
+        batch.batch["advantages"] = token_adv
+        batch.batch["returns"] = token_adv
+
+        self._log_care_events(care_events, step)
+        return batch
 
     def fit(self):
         """
@@ -1400,6 +874,102 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
                             reward_metrics = {f"reward/{k}": v for k, v in reduce_metrics(reward_metrics).items()}
                             metrics.update(reward_metrics)
 
+                        # 1P1N-Reflex hook: resample m candidates using a critique from the negative sample
+                        if getattr(self.config, "reflex", None) and self.config.reflex.enable and self.config.reflex.m > 0:
+                            try:
+                                from ..hooks.reflex_1p1n import (
+                                    apply_reflex_1p1n,
+                                    apply_reflex_1p1n_cgsg,
+                                    process_reflex_events,
+                                )
+
+                                # Run resampling between reward and advantage
+                                with timer("reflex", timing_raw):
+                                    appended = None
+                                    reflex_metrics = {}
+                                    kept_indices = None
+                                    reflex_events: List[Dict[str, Any]] = []
+                                    # Ensure rollout engine is available for generation
+                                    try:
+                                        self.actor_rollout_ref_wg.prepare_rollout_engine()
+                                        if self.config.algorithm.grpo_variant == "cgsg":
+                                            appended, kept_indices, reflex_metrics, reflex_events = apply_reflex_1p1n_cgsg(
+                                                batch=batch,
+                                                tokenizer=self.tokenizer,
+                                                llm_generate_fn=self.actor_rollout_ref_wg.generate_sequences,
+                                                sampling_params=self.config.reflex.sampling,
+                                                cfg=self.config.reflex,
+                                                cgsg_config=self.config.algorithm.cgsg_config,
+                                            )
+                                            # Filter original batch down to 1P1N membership (if provided)
+                                            if kept_indices is not None and len(kept_indices) > 0:
+                                                batch = batch.index_select(kept_indices)
+                                        else:
+                                            appended, reflex_metrics, reflex_events = apply_reflex_1p1n(
+                                                batch=batch,
+                                                tokenizer=self.tokenizer,
+                                                llm_generate_fn=self.actor_rollout_ref_wg.generate_sequences,
+                                                sampling_params=self.config.reflex.sampling,
+                                                cfg=self.config.reflex,
+                                            )
+                                    finally:
+                                        # Always release even if hook fails
+                                        try:
+                                            self.actor_rollout_ref_wg.release_rollout_engine()
+                                        except Exception:
+                                            pass
+
+                                    if appended is not None and len(appended) > 0:
+                                        # Compute reward for appended rows
+                                        reward_tensor_new, _reward_metrics_new = ray.get(
+                                            self.reward_fn.compute_reward.remote(appended)
+                                        )
+                                        appended.batch["token_level_scores"] = reward_tensor_new
+
+                                        # Compute model/ref log-probs for appended rows only
+                                        old_lp_new = self.actor_rollout_ref_wg.compute_log_probs(appended)
+                                        appended = appended.union(old_lp_new)
+                                        if self.use_reference_policy:
+                                            ref_lp_new = self.actor_rollout_ref_wg.compute_ref_log_probs(appended)
+                                            appended = appended.union(ref_lp_new)
+
+                                        # Neg->pos conversion rate on appended
+                                        neg_to_pos = (reward_tensor_new.sum(dim=-1) > 0).float().mean().item()
+
+                                        # Instrumentation (optional JSON logging)
+                                        if reflex_events:
+                                            process_reflex_events(
+                                                events=reflex_events,
+                                                appended=appended,
+                                                tokenizer=self.tokenizer,
+                                                rewards=reward_tensor_new,
+                                                cfg=self.config.reflex,
+                                                step=self.global_step,
+                                            )
+
+                                        # Concat back to the batch
+                                        batch = DataProto.concat([batch, appended])
+
+                                        # Log reflex metrics
+                                        metrics.update(
+                                            {
+                                                "reflex/groups_triggered": reflex_metrics.get(
+                                                    "reflex/groups_triggered", 0.0
+                                                ),
+                                                "reflex/samples_added": reflex_metrics.get(
+                                                    "reflex/samples_added", 0.0
+                                                ),
+                                                "reflex/neg_to_pos_rate": neg_to_pos,
+                                            }
+                                        )
+                                    else:
+                                        # No-op; still record zeroed metrics
+                                        metrics.setdefault("reflex/groups_triggered", 0.0)
+                                        metrics.setdefault("reflex/samples_added", 0.0)
+                                        metrics.setdefault("reflex/neg_to_pos_rate", 0.0)
+                            except Exception as e:
+                                print(f"Reflex hook failed gracefully: {e}")
+
                         # apply kl penalty if available
                         if not self.config.algorithm.use_kl_loss and self.use_reference_policy:
                             # apply kl penalty to reward
@@ -1409,12 +979,15 @@ class RayPPOTrainer(SimpleTreeGRPOMixin):
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
                         # compute advantages, executed on the driver process
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                        )
+                        if self.config.algorithm.grpo_variant == "care":
+                            batch = self._apply_care_variant(batch, self.global_step)
+                        else:
+                            batch = compute_advantage(
+                                batch,
+                                adv_estimator=self.config.algorithm.adv_estimator,
+                                gamma=self.config.algorithm.gamma,
+                                lam=self.config.algorithm.lam,
+                            )
                 else:
                     # TreeGRPO processing
                     self._balance_batch(batch, metrics=metrics)

@@ -17,9 +17,10 @@ PPO config
 
 import os
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from ..workers.config import WorkerConfig
+from ..hooks.reflex_1p1n import ReflexCfg
 
 
 def recursive_post_init(dataclass_obj):
@@ -102,20 +103,68 @@ class AlgorithmConfig:
     filter_high: float = 0.99
     """filter out high reward samples if online filtering"""
     grpo_variant: str = "standard"
-    """GRPO variant: 'standard', 'pge', or 'cgsg'"""
+    """GRPO variant: 'standard', 'pge', 'cgsg', or 'care'"""
     pge_config: dict = field(default_factory=lambda: {
         "num_perturbations": 4,
         "perturbation_methods": ["token_substitute", "token_delete", "token_insert"],
         "perturbation_strength": 0.1
     })
     """PGE configuration"""
+    norm_scheme: str = "zscore"
+    """Advantage normalization scheme for CGSG"""
     cgsg_config: dict = field(default_factory=lambda: {
         "num_negatives": 4,
         "negative_selection_strategy": "lowest_reward",
         "loss_type": "normalized_advantage",
-        "reward_threshold": 0.99  # Samples with reward >= this are considered golden
+        "norm_scheme": "zscore",
+        "neg_scale": 0.5,
+        "rescue_all_negative": False,
+        "rescue_delta": 0.1,
+        "reward_threshold": 0.99,  # Samples with reward >= this are considered golden
+        "contrast": {
+            "tau": 0.6,
+            "score": "adv",
+            "neg_weight": 1.0,
+        },
     })
     """CGSG configuration"""
+
+
+@dataclass
+class CareRescueCfg:
+    enable: bool = True
+    delta: float = 0.1
+
+
+@dataclass
+class CareInstrumentCfg:
+    enable: bool = False
+    care_jsonl: Optional[str] = None
+    rgr_jsonl: Optional[str] = None
+
+
+@dataclass
+class CareCfg:
+    K: int = 4
+    M: int = 6
+    neg_scale_s: float = 0.5
+    eps: float = 1e-6
+    equalize: bool = True
+    rescue: CareRescueCfg = field(default_factory=CareRescueCfg)
+    token_weighting: str = "region_weighted"
+    gamma_pos: float = 0.005
+    instrument: CareInstrumentCfg = field(default_factory=CareInstrumentCfg)
+
+
+@dataclass
+class RgrCfg:
+    enable: bool = True
+    template: str = "structured"
+    max_critique_tokens: int = 64
+    s_refl: Optional[float] = None
+    sampling: Dict[str, Any] = field(
+        default_factory=lambda: {"temperature": 0.6, "top_p": 0.95, "max_tokens": 512}
+    )
 
 
 @dataclass
@@ -176,6 +225,9 @@ class PPOConfig:
     worker: WorkerConfig = field(default_factory=WorkerConfig)
     algorithm: AlgorithmConfig = field(default_factory=AlgorithmConfig)
     trainer: TrainerConfig = field(default_factory=TrainerConfig)
+    reflex: ReflexCfg = field(default_factory=ReflexCfg)
+    care: CareCfg = field(default_factory=CareCfg)
+    rgr: RgrCfg = field(default_factory=RgrCfg)
 
     def post_init(self):
         self.worker.rollout.prompt_length = self.data.max_prompt_length
