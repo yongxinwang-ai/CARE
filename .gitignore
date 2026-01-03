@@ -185,6 +185,8 @@ images*
 
 tests/*
 
+/tests/
+
 visual/
 
 AGENTS.md
