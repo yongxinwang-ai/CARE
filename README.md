@@ -6,6 +6,8 @@
 ## News
 
 2026.2 Our paper is accepted by **CVPR 2026**! See you in Denver!
+
+
 2026.1 Code is released.
 
 ## Method overview
