@@ -1,6 +1,13 @@
-# CARE: Contrastive Anchored-REflection for Verifiable Multimodal Reasoning
+# [CVPR2026] CARE What Fails: Contrastive Anchored-REflection for Verifiable Multimodal Reasoning
 
-📑 <a href="https://arxiv.org/pdf/2512.19554">Paper</a> | 🤗 <a href="https://huggingface.co/YongxinWang">Hugging Face</a>
+📑 <a href="https://arxiv.org/abs/2512.19554">arXiv</a> | 🔎 <a href="https://www.alphaxiv.org/abs/2512.19554">AlphaXiv</a> | 🤗 <a href="https://huggingface.co/YongxinWang">Hugging Face</a>
+
+![CARE overview](assets/overview.png)
+
+CARE is a failure-centric post-training framework for verifiable multimodal reasoning.
+Instead of discarding wrong rollouts, CARE turns close-but-wrong attempts into structured
+supervision with an anchored-contrastive objective and Reflection-Guided Resampling (RGR),
+while keeping single-pass inference with no test-time reflection.
 
 
 ## News
@@ -10,25 +17,63 @@
 
 2026.1 Code is released.
 
+## Highlights
+
+- Failure-centric RLVR for multimodal reasoning: CARE explicitly learns from failed rollouts
+  instead of treating them as discarded samples or uniform negatives.
+- Anchored-contrastive training: pick the shortest verified-correct rollout as the anchor,
+  select semantically proximate hard negatives, normalize advantages within the subgroup,
+  and down-weight only negative advantages.
+- Reflection-Guided Resampling (RGR): repair exactly one representative hard negative during
+  training, re-verify it, and reuse the repaired rollout if it becomes correct.
+- All-negative rescue: inject a small pseudo-contrast when a rollout group has no successes,
+  preventing zero-signal updates.
+- No extra test-time cost: CARE improves training-time credit assignment without requiring
+  reflection or multi-pass decoding at inference.
+
 ## Method overview
 
-Given a multimodal prompt x = <image(s), question>:
+For a multimodal prompt `x = <image(s), question>`, CARE samples a group of rollouts and
+uses a programmatic verifier over the final answer and output format to build a
+failure-aware learning signal:
 
 1. Sample a group of rollouts (size G).
-2. Verify each rollout with a programmatic verifier (exact match / format checks).
-3. If there is at least one verified-correct rollout:
-   - Choose the anchor as the shortest verified-correct rationale.
-   - Select hard negatives closest to the anchor in rationale space (cosine distance over pooled hidden states).
-   - Compute within-subgroup normalized advantages and down-weight negatives.
-   - Optionally run RGR: repair one hard negative once, re-verify, and replace if it becomes correct.
-4. If all rollouts are incorrect:
-   - Apply an all-negative rescue pseudo-contrast to avoid stalled gradients.
+2. Verify each rollout with a programmatic verifier.
+3. If at least one rollout is correct:
+   - Choose the anchor as the shortest verified-correct rollout.
+   - Select hard negatives that are closest to the anchor in rationale space via cosine proximity.
+   - Normalize rewards only inside the selected subgroup and down-weight only the negative advantages.
+   - If fewer than the target number of hard negatives are available, rescale the update size to keep training stable.
+4. During training, optionally run RGR on one representative hard negative:
+   - Insert a short repair cue.
+   - Resample once.
+   - Replace the original failure if the repaired rollout becomes verifier-positive; otherwise keep it with a reduced penalty.
+5. If all rollouts are incorrect:
+   - Apply an all-negative rescue with a small pseudo-contrast so gradients do not stall.
+6. Use a region-weighted policy objective:
+   - Answer tokens receive full weight.
+   - Positive rationale tokens receive a small weight.
+   - Failing rationale tokens are masked out.
 
-CARE reshapes selection and advantages only. The reward function itself is unchanged.
+CARE changes how training signals are formed from rollouts, but keeps the verifier and
+single-decode inference pipeline unchanged.
 
 ---
 
-## Implementation map (this repo)
+## Benchmark snapshot
+
+According to the paper, CARE delivers consistent gains over existing RLVR baselines:
+
+- On **Qwen2.5-VL-7B**, CARE improves macro-averaged accuracy by **+4.6 points over GRPO**
+  across six verifiable visual-reasoning benchmarks.
+- On **Qwen3-VL-8B**, CARE reaches competitive or state-of-the-art results on
+  **MathVista mini** and **MMMU-Pro** under the same evaluation protocol.
+- The paper attributes most of the gains to the anchored-contrastive objective, with RGR
+  providing an additional improvement by converting near-miss failures into usable positives.
+
+---
+
+## Repository map
 
 - CARE subgrouping + advantages: `verl/algorithms/adv_estimators/care.py`
 - Cosine hard negatives: `verl/algorithms/neg_selectors/cosine_hardneg.py`
@@ -84,7 +129,7 @@ python3 -m verl.trainer.main \
 ## CARE configuration
 
 CARE is exposed via `algorithm.grpo_variant=care` and the `care.*` / `rgr.*` sections in
-`examples/config.yaml`. Defaults match the roadmap:
+`examples/config.yaml`. The provided Geometry3K example script uses:
 
 - Rollouts per prompt: G = worker.rollout.n (default 8 in examples)
 - Hard-negative subgroup size: care.K = 4
@@ -99,14 +144,14 @@ CARE is exposed via `algorithm.grpo_variant=care` and the `care.*` / `rgr.*` sec
 
 ## Citation
 
-If you use this code, please cite the CARE paper:
+If you use this code, please cite the paper. The arXiv entry is:
 
 ```bibtex
 @article{wang2025care,
   title   = {CARE What Fails: Contrastive Anchored-REflection for Verifiable Multimodal Reasoning},
   author  = {Wang, Yongxin and Yang, Zhicheng and Cao, Meng and Han, Mingfei and Lin, Haokun and Zhu, Yingying and Chang, Xiaojun and Liang, Xiaodan},
-  year    = {2025},
-  note    = {arXiv preprint (add identifier once available)}
+  journal = {arXiv preprint arXiv:2512.19554},
+  year    = {2025}
 }
 ```
 
